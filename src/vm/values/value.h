@@ -54,7 +54,12 @@ public:
     bool IsSmi() const { return raw_.IsSmi(); }
     bool IsHeapObject() const { return raw_.IsHeapObject(); }
 
-    bool IsNumber() const;      // Smi or HeapNumber
+    // NOTE: The Is*() type-check functions are defined inline AFTER the
+    // HeapObject class declaration (at the bottom of this file) because
+    // they need to call HeapObject::kind(), which requires the full
+    // HeapObject definition. See the "Inline type checks" section below.
+
+    bool IsNumber() const;
     bool IsString() const;
     bool IsObject() const;
     bool IsArray() const;
@@ -68,6 +73,7 @@ public:
     intptr_t AsSmi() const { return raw_.AsSmi(); }
     HeapObject* AsHeapObject() const { return raw_.AsHeapObject(); }
 
+    // These cast functions remain non-inline (they're cold paths with DCHECKs).
     double AsNumber() const;
     JSString* AsString() const;
     JSObject* AsObject() const;
@@ -109,23 +115,38 @@ enum class HeapObjectKind : uint8_t {
 const char* HeapObjectKindName(HeapObjectKind kind);
 
 // HeapObject header - first word of every heap object.
-// We don't use C++ virtual functions; instead we dispatch on Shape*.
+// We don't use C++ virtual functions; instead we dispatch on the
+// HeapObjectKind stored directly in the header.
 //
 // Layout:
-//   [ Shape*   | mark_bits ]   <- header (one pointer)
+//   [ Shape*   | mark_bits ]   <- pointer (mark_bits in low 2 bits)
+//   [ HeapObjectKind kind_ ]   <- cached kind (1 byte, no dereference)
+//   [ ... padding ...        ]
 //   [ ...object body...      ]
 //
-// mark_bits live in the low 2 bits of the shape pointer:
-//   bit 0: GC mark (white/grey/black encoding uses 2 bits)
-//   bit 1: remembered (in write barrier)
+// The kind_ field is a cached copy of shape()->object_kind(). It is set
+// by set_shape() and never changes after initialization. Caching it in
+// the header means Value::IsString() / IsObject() / etc. can read the
+// kind with a single byte load — no Shape pointer dereference needed.
+// This is critical for interpreter performance: every type check in the
+// dispatch loop becomes a single comparison instead of a function call
+// + pointer dereference.
 //
-// Shapes are aligned to 4 bytes so the low 2 bits are free.
+// mark_bits live in the low 2 bits of the shape pointer:
+//   bit 0: GC mark
+//   bit 1: remembered (in write barrier)
 class HeapObject {
 public:
-    HeapObjectKind kind() const;
-    Shape* shape() const;
+    // Read the cached kind — INLINE, no pointer dereference.
+    HeapObjectKind kind() const { return kind_; }
+    // Read the shape pointer — INLINE (just masks off the mark bits).
+    Shape* shape() const {
+        return reinterpret_cast<Shape*>(shape_and_mark_ & ~uintptr_t{3});
+    }
 
-    // Set the shape. For internal use by the GC and the object model.
+    // Set the shape. Non-inline because it calls Shape::object_kind()
+    // (defined in shape.h, which can't be included here due to circular
+    // dependency). Also caches the kind in the header.
     void set_shape(Shape* s);
 
     // Tagged pointer to self.
@@ -139,10 +160,54 @@ public:
 
 private:
     uintptr_t shape_and_mark_;   // Shape* | mark_bits
+    HeapObjectKind kind_;        // cached from shape()->object_kind()
 };
 
-static_assert(sizeof(HeapObject) == sizeof(uintptr_t),
-              "HeapObject header must be one pointer");
+// Note: sizeof(HeapObject) is now 2 pointers (16 bytes on 64-bit) due to
+// the added kind_ field. This is a deliberate trade-off: 8 extra bytes per
+// object in exchange for eliminating a pointer dereference on every type
+// check, which is the single hottest operation in the interpreter.
+
+// -----------------------------------------------------------------------------
+// Inline type checks for Value.
+//
+// These are defined here (after HeapObject) because they call
+// HeapObject::kind(), which is an inline method that reads the cached
+// kind_ byte from the header. The whole chain is:
+//   Value::IsString() -> raw_.AsHeapObject()->kind() -> compare byte
+// No function calls, no Shape pointer dereference. This is the single
+// hottest path in the interpreter dispatch loop.
+// -----------------------------------------------------------------------------
+inline bool Value::IsNumber() const {
+    if (raw_.IsSmi()) return true;
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kNumber;
+}
+inline bool Value::IsString() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kString;
+}
+inline bool Value::IsObject() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kObject;
+}
+inline bool Value::IsArray() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kArray;
+}
+inline bool Value::IsFunction() const {
+    if (!IsHeapObject()) return false;
+    HeapObjectKind k = raw_.AsHeapObject()->kind();
+    return k == HeapObjectKind::kFunction || k == HeapObjectKind::kExternal;
+}
+inline bool Value::IsHostFunction() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kExternal;
+}
+inline bool Value::IsBoolean() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kBoolean;
+}
+inline bool Value::IsUndefined() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kUndefined;
+}
+inline bool Value::IsNull() const {
+    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kNull;
+}
 
 }  // namespace v12
 

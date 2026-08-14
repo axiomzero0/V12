@@ -18,6 +18,9 @@
 #ifndef V12_VM_RUNTIME_RUNTIME_H_
 #define V12_VM_RUNTIME_RUNTIME_H_
 
+#include <cmath>
+
+#include "vm/objects/object.h"
 #include "vm/values/value.h"
 
 namespace v12 {
@@ -103,7 +106,175 @@ uint32_t ToUint32(Isolate* iso, Value v);
 // Box a double into either a Smi (if it fits) or a HeapNumber.
 Value FromDouble(Isolate* iso, double d);
 
+// ----- Inline Smi fast paths for the interpreter -----
+// These handle the common case where both operands are Smis and the result
+// fits in a Smi. They return true if they handled the operation (with the
+// result in `out`); false if the caller should fall back to the slow path.
+// Inlining avoids the function-call overhead of Add()/Sub()/etc. for the
+// overwhelmingly common Smi case.
+
+// Smi range check (from tagged-value.h, mirrored here for convenience).
+inline bool SmiFitsFast(intptr_t v) {
+    // Smis use 62 bits on 64-bit (1 tag bit + 63 value bits, but the top
+    // bit is the sign, so 62 usable). This check is simplified.
+    return v >= -(intptr_t{1} << 62) && v < (intptr_t{1} << 62);
+}
+
+// Try to add two Values as Smis. Returns true if both were Smis and the
+// result fit (no overflow); false otherwise.
+inline bool TrySmiAdd(Value a, Value b, Value* out) {
+    if (V12_LIKELY(a.IsSmi() && b.IsSmi())) {
+        intptr_t x = a.AsSmi();
+        intptr_t y = b.AsSmi();
+        // Use __builtin_add_overflow for robust overflow detection.
+#if defined(V12_COMPILER_CLANG) || defined(V12_COMPILER_GCC)
+        intptr_t sum;
+        if (V12_LIKELY(!__builtin_add_overflow(x, y, &sum) && SmiFitsFast(sum))) {
+            *out = Value::FromSmi(sum);
+            return true;
+        }
+#else
+        intptr_t sum = x + y;
+        if (V12_LIKELY(SmiFitsFast(sum))) {
+            *out = Value::FromSmi(sum);
+            return true;
+        }
+#endif
+    }
+    return false;
+}
+
+inline bool TrySmiSub(Value a, Value b, Value* out) {
+    if (V12_LIKELY(a.IsSmi() && b.IsSmi())) {
+        intptr_t x = a.AsSmi();
+        intptr_t y = b.AsSmi();
+#if defined(V12_COMPILER_CLANG) || defined(V12_COMPILER_GCC)
+        intptr_t diff;
+        if (V12_LIKELY(!__builtin_sub_overflow(x, y, &diff) && SmiFitsFast(diff))) {
+            *out = Value::FromSmi(diff);
+            return true;
+        }
+#else
+        intptr_t diff = x - y;
+        if (V12_LIKELY(SmiFitsFast(diff))) {
+            *out = Value::FromSmi(diff);
+            return true;
+        }
+#endif
+    }
+    return false;
+}
+
+inline bool TrySmiMul(Value a, Value b, Value* out) {
+    if (V12_LIKELY(a.IsSmi() && b.IsSmi())) {
+        intptr_t x = a.AsSmi();
+        intptr_t y = b.AsSmi();
+#if defined(V12_COMPILER_CLANG) || defined(V12_COMPILER_GCC)
+        intptr_t prod;
+        if (V12_LIKELY(!__builtin_mul_overflow(x, y, &prod) && SmiFitsFast(prod))) {
+            *out = Value::FromSmi(prod);
+            return true;
+        }
+#else
+        if (x == 0 || y == 0) { *out = Value::FromSmi(0); return true; }
+        intptr_t prod = x * y;
+        if (V12_LIKELY(prod / x == y && SmiFitsFast(prod))) {
+            *out = Value::FromSmi(prod);
+            return true;
+        }
+#endif
+    }
+    return false;
+}
+
+// Bitwise ops can't overflow (they're Int32), so they always succeed when
+// both operands are Smis. But we still need to check for Smi-ness.
+inline bool TrySmiBitOr(Value a, Value b, Value* out) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *out = Value::FromSmi(a.AsSmi() | b.AsSmi());
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiBitAnd(Value a, Value b, Value* out) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *out = Value::FromSmi(a.AsSmi() & b.AsSmi());
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiBitXor(Value a, Value b, Value* out) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *out = Value::FromSmi(a.AsSmi() ^ b.AsSmi());
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiShl(Value a, Value b, Value* out) {
+    if (a.IsSmi() && b.IsSmi()) {
+        intptr_t shift = b.AsSmi() & 63;
+        *out = Value::FromSmi(a.AsSmi() << shift);
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiShr(Value a, Value b, Value* out) {
+    if (a.IsSmi() && b.IsSmi()) {
+        intptr_t shift = b.AsSmi() & 63;
+        *out = Value::FromSmi(a.AsSmi() >> shift);
+        return true;
+    }
+    return false;
+}
+
+// Smi comparison fast paths. Return true and set `result` (a bool) if both
+// operands are Smis. The caller converts the bool to a JS boolean Value.
+// This avoids needing the Isolate (for true/false singletons) in the fast path.
+inline bool TrySmiLessThan(Value a, Value b, bool* result) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *result = a.AsSmi() < b.AsSmi();
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiGreaterThan(Value a, Value b, bool* result) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *result = a.AsSmi() > b.AsSmi();
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiLessThanOrEqual(Value a, Value b, bool* result) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *result = a.AsSmi() <= b.AsSmi();
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiGreaterThanOrEqual(Value a, Value b, bool* result) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *result = a.AsSmi() >= b.AsSmi();
+        return true;
+    }
+    return false;
+}
+inline bool TrySmiStrictEquals(Value a, Value b, bool* result) {
+    if (a.IsSmi() && b.IsSmi()) {
+        *result = a.AsSmi() == b.AsSmi();
+        return true;
+    }
+    // If one is Smi and the other isn't, let the slow path handle it
+    // (could be Smi vs HeapNumber — numerically equal but different types).
+    return false;
+}
+
 // Returns true if the value is "truthy" per JS semantics.
+// This is the fast version used by the interpreter's JumpIf* handlers.
+// It's declared here and defined in runtime.cc (it needs the full
+// definitions of JSBoolean, JSNumber, JSString which are incomplete here).
+bool IsTruthyFast(Value v);
+
+// The original version (kept for external callers that pass Isolate).
 bool IsTruthy(Isolate* iso, Value v);
 
 }  // namespace v12

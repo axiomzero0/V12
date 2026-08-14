@@ -43,8 +43,13 @@ namespace v12 {
 // Construction / destruction
 // -----------------------------------------------------------------------------
 Interp::Interp(Isolate* iso) : iso_(iso) {
-    reg_storage_.reserve(1024);   // pre-allocate to avoid early reallocs
-    frames_.reserve(64);
+    // Pre-allocate enough capacity for the frame stack and register storage
+    // so that recursive calls don't trigger vector reallocation (which would
+    // invalidate the `frame` pointer and `regs` in ExecuteTop). The max_depth_
+    // limit is 1000, so we reserve 1024 frames. Each frame's register file
+    // averages ~16 slots, so we reserve 16384 Value slots.
+    reg_storage_.reserve(16384);
+    frames_.reserve(1024);
 }
 
 Interp::~Interp() = default;
@@ -132,254 +137,375 @@ InterpResult Interp::CallHostFunction(HostFunction* fn, Value this_val,
 
 // -----------------------------------------------------------------------------
 // Dispatch loop
+//
+// We use computed-goto dispatch (GCC/Clang's "labels as values" extension).
+// This is significantly faster than a switch statement because:
+//   1. Each opcode handler ends with `goto *dispatch[*pc++]` — a single
+//      indirect branch — instead of `break; loop-check; switch-jump`.
+//   2. The branch predictor can learn the pattern of opcodes (e.g. "Add
+//      is usually followed by Star") and predict the indirect branch
+//      correctly, which is impossible with a single switch jump table.
+//
+// This requires GCC or Clang. MSVC is not supported.
 // -----------------------------------------------------------------------------
+#define V12_DISPATCH()  goto *dispatch_table[*pc++]
+
 InterpResult Interp::ExecuteTop() {
     Frame* frame = &frames_.back();
-    // Local copies for speed. We re-sync `frame->regs` etc. after any
-    // operation that may invalidate `frame` (i.e. recursive calls that
-    // grow frames_).
     const uint8_t* pc = frame->pc;
     Value acc = iso_->undefined_value();
     FunctionInfo* info = frame->info;
     Value* regs = frame->regs;
     Context* ctx = frame->context;
-
-    // Lambda to re-sync locals after a recursive call.
-    // `pc` is preserved by the caller via `frame->pc = pc;` before the call.
+    // Cache the bytecode base pointer — used by every Jump handler and by
+    // Call for handler-table lookup. Avoids repeated `info->bytecode.data()`
+    // calls (which are vector data accesses).
+    const uint8_t* bytecode_base = info->bytecode.data();
     auto sync = [&]() {
         frame = &frames_.back();
         regs = frame->regs;
         ctx = frame->context;
         info = frame->info;
+        bytecode_base = info->bytecode.data();
     };
 
-    while (true) {
-        Op op = static_cast<Op>(*pc);
-        ++pc;
-        switch (op) {
+    // Computed-goto dispatch table. Each entry is the address of the label
+    // for that opcode. Indexed by the opcode byte.
+    static const void* dispatch_table[] = {
+        &&L_LdaConst, &&L_LdaSmi, &&L_LdaZero, &&L_LdaUndefined,
+        &&L_LdaNull, &&L_LdaTrue, &&L_LdaFalse, &&L_LdaThis,
+        &&L_Ldar, &&L_Star, &&L_Mov,
+        &&L_Add, &&L_Sub, &&L_Mul, &&L_Div, &&L_Mod, &&L_Exp,
+        &&L_BitOr, &&L_BitAnd, &&L_BitXor, &&L_Shl, &&L_Shr, &&L_Ushr,
+        &&L_AddConst, &&L_SubConst, &&L_MulConst,
+        &&L_Negate, &&L_BitNot, &&L_LogicalNot, &&L_Typeof,
+        &&L_TestEqual, &&L_TestNotEqual, &&L_TestEqStrict, &&L_TestNotEqStrict,
+        &&L_TestLessThan, &&L_TestGreaterThan, &&L_TestLessThanOrEqual,
+        &&L_TestGreaterThanOrEqual, &&L_TestInstanceOf, &&L_TestIn,
+        &&L_Inc, &&L_Dec,
+        &&L_Jump, &&L_JumpIfTrue, &&L_JumpIfFalse, &&L_JumpIfNull,
+        &&L_JumpIfUndefined, &&L_JumpIfNotNullOrUndefined,
+        &&L_JumpIfToBooleanTrue, &&L_JumpIfToBooleanFalse, &&L_JumpLoop,
+        &&L_LoadProperty, &&L_LoadIndexed, &&L_StoreProperty, &&L_StoreIndexed,
+        &&L_LoadGlobal, &&L_StoreGlobal, &&L_LoadContext, &&L_StoreContext,
+        &&L_Call, &&L_CallProperty, &&L_Call0, &&L_Call1, &&L_Call2,
+        &&L_Construct, &&L_CallBuiltin,
+        &&L_NewObject, &&L_NewArray, &&L_DefineProperty, &&L_CreateClosure,
+        &&L_PushArray, &&L_LoadArrayLength, &&L_StoreArrayLength,
+        &&L_CreateContext, &&L_PushContext, &&L_PopContext,
+        &&L_ObjectKeys, &&L_GetIterator,
+        &&L_ForInPrepare, &&L_ForInNext, &&L_ForInDone,
+        &&L_Return, &&L_ReturnUndefined,
+        &&L_Throw, &&L_TryCatch, &&L_TryFinally, &&L_Exception,
+        &&L_Debugger,
+        &&L_Pop, &&L_Dup, &&L_Nop, &&L_Illegal,
+    };
+    V12_DISPATCH();
             // ----- Loading constants -----
-            case Op::LdaConst: {
+            L_LdaConst: {
                 uint32_t idx = ReadU32(&pc);
                 acc = info->ResolveConstant(iso_, idx);
-                break;
+                V12_DISPATCH();
             }
-            case Op::LdaSmi: {
+            L_LdaSmi: {
                 uint8_t v = ReadU8(&pc);
                 acc = Value::FromSmi(static_cast<intptr_t>(v));
-                break;
+                V12_DISPATCH();
             }
-            case Op::LdaZero:
+            L_LdaZero:
                 acc = Value::FromSmi(0);
-                break;
-            case Op::LdaUndefined:
+                V12_DISPATCH();
+            L_LdaUndefined:
                 acc = iso_->undefined_value();
-                break;
-            case Op::LdaNull:
+                V12_DISPATCH();
+            L_LdaNull:
                 acc = iso_->null_value();
-                break;
-            case Op::LdaTrue:
+                V12_DISPATCH();
+            L_LdaTrue:
                 acc = iso_->true_value();
-                break;
-            case Op::LdaFalse:
+                V12_DISPATCH();
+            L_LdaFalse:
                 acc = iso_->false_value();
-                break;
-            case Op::LdaThis:
+                V12_DISPATCH();
+            L_LdaThis:
                 acc = frame->this_val;
-                break;
+                V12_DISPATCH();
 
             // ----- Register moves -----
-            case Op::Ldar: {
+            L_Ldar: {
                 uint8_t r = ReadU8(&pc);
                 acc = regs[r];
-                break;
+                V12_DISPATCH();
             }
-            case Op::Star: {
+            L_Star: {
                 uint8_t r = ReadU8(&pc);
                 regs[r] = acc;
-                break;
+                V12_DISPATCH();
             }
-            case Op::Mov: {
+            L_Mov: {
                 uint8_t dst = ReadU8(&pc);
                 uint8_t src = ReadU8(&pc);
                 regs[dst] = regs[src];
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Binary arithmetic -----
             // Format: op  r:8  idx:16   ->   acc = acc <op> regs[r]
-            case Op::Add: {
-                uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);  // feedback slot, unused for now
-                acc = Add(iso_, acc, regs[r]);
-                break;
-            }
-            case Op::Sub: {
+            // Hot path: try Smi fast path first, fall back to slow path.
+            L_Add: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = Sub(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiAdd(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Add(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::Mul: {
+            L_Sub: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = Mul(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiSub(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Sub(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::Div: {
+            L_Mul: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
+                Value result;
+                if (V12_LIKELY(TrySmiMul(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Mul(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
+            }
+            L_Div: {
+                uint8_t r = ReadU8(&pc);
+                (void)ReadU16(&pc);
+                // No Smi fast path for Div (result may be non-integer).
                 acc = Div(iso_, acc, regs[r]);
-                break;
+                V12_DISPATCH();
             }
-            case Op::Mod: {
+            L_Mod: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 acc = Mod(iso_, acc, regs[r]);
-                break;
+                V12_DISPATCH();
             }
-            case Op::Exp: {
+            L_Exp: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 acc = Exp(iso_, acc, regs[r]);
-                break;
+                V12_DISPATCH();
             }
-            case Op::BitOr: {
+            L_BitOr: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = BitOr(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiBitOr(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = BitOr(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::BitAnd: {
+            L_BitAnd: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = BitAnd(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiBitAnd(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = BitAnd(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::BitXor: {
+            L_BitXor: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = BitXor(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiBitXor(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = BitXor(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::Shl: {
+            L_Shl: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = Shl(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiShl(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Shl(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::Shr: {
+            L_Shr: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = Shr(iso_, acc, regs[r]);
-                break;
+                Value result;
+                if (V12_LIKELY(TrySmiShr(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Shr(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::Ushr: {
+            L_Ushr: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 acc = Ushr(iso_, acc, regs[r]);
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Binary with constant -----
             // Format: op  const:32  idx:16
-            case Op::AddConst: {
+            L_AddConst: {
                 uint32_t cidx = ReadU32(&pc);
                 (void)ReadU16(&pc);
                 acc = Add(iso_, acc, info->ResolveConstant(iso_, cidx));
-                break;
+                V12_DISPATCH();
             }
-            case Op::SubConst: {
+            L_SubConst: {
                 uint32_t cidx = ReadU32(&pc);
                 (void)ReadU16(&pc);
                 acc = Sub(iso_, acc, info->ResolveConstant(iso_, cidx));
-                break;
+                V12_DISPATCH();
             }
-            case Op::MulConst: {
+            L_MulConst: {
                 uint32_t cidx = ReadU32(&pc);
                 (void)ReadU16(&pc);
                 acc = Mul(iso_, acc, info->ResolveConstant(iso_, cidx));
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Unary -----
             // Format: op  idx:16   (idx is a feedback slot)
-            case Op::Negate: {
+            L_Negate: {
                 (void)ReadU16(&pc);
                 acc = Negate(iso_, acc);
-                break;
+                V12_DISPATCH();
             }
-            case Op::BitNot: {
+            L_BitNot: {
                 (void)ReadU16(&pc);
                 acc = BitNot(iso_, acc);
-                break;
+                V12_DISPATCH();
             }
-            case Op::LogicalNot:
-                acc = IsTruthy(iso_, acc) ? iso_->false_value() : iso_->true_value();
-                break;
-            case Op::Typeof:
+            L_LogicalNot:
+                acc = IsTruthyFast(acc) ? iso_->false_value() : iso_->true_value();
+                V12_DISPATCH();
+            L_Typeof:
                 acc = Typeof(iso_, acc);
-                break;
+                V12_DISPATCH();
 
             // ----- Comparison -----
             // Format: op  r:8  idx:16
-            case Op::TestEqual: {
+            L_TestEqual: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = LooseEquals(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = LooseEquals(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestNotEqual: {
+            L_TestNotEqual: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = LooseEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
-                      ? iso_->false_value() : iso_->true_value();
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
+                    acc = result ? iso_->false_value() : iso_->true_value();
+                } else {
+                    acc = LooseEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
+                          ? iso_->false_value() : iso_->true_value();
+                }
+                V12_DISPATCH();
             }
-            case Op::TestEqStrict: {
+            L_TestEqStrict: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = StrictEquals(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = StrictEquals(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestNotEqStrict: {
+            L_TestNotEqStrict: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = StrictEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
-                      ? iso_->false_value() : iso_->true_value();
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
+                    acc = result ? iso_->false_value() : iso_->true_value();
+                } else {
+                    acc = StrictEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
+                          ? iso_->false_value() : iso_->true_value();
+                }
+                V12_DISPATCH();
             }
-            case Op::TestLessThan: {
+            L_TestLessThan: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = LessThan(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiLessThan(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = LessThan(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestGreaterThan: {
+            L_TestGreaterThan: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = GreaterThan(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiGreaterThan(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = GreaterThan(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestLessThanOrEqual: {
+            L_TestLessThanOrEqual: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = LessThanOrEqual(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiLessThanOrEqual(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = LessThanOrEqual(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestGreaterThanOrEqual: {
+            L_TestGreaterThanOrEqual: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
-                acc = GreaterThanOrEqual(iso_, acc, regs[r]);
-                break;
+                bool result;
+                if (V12_LIKELY(TrySmiGreaterThanOrEqual(acc, regs[r], &result))) {
+                    acc = result ? iso_->true_value() : iso_->false_value();
+                } else {
+                    acc = GreaterThanOrEqual(iso_, acc, regs[r]);
+                }
+                V12_DISPATCH();
             }
-            case Op::TestInstanceOf: {
+            L_TestInstanceOf: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 // instanceof not yet implemented; default to false.
                 acc = iso_->false_value();
-                break;
+                V12_DISPATCH();
             }
-            case Op::TestIn: {
+            L_TestIn: {
                 uint8_t r = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 Value key = acc;
@@ -403,72 +529,87 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     acc = iso_->false_value();
                 }
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Inc / Dec -----
-            case Op::Inc: {
+            L_Inc: {
                 (void)ReadU16(&pc);
+                // Fast path for Smi.
+                if (V12_LIKELY(acc.IsSmi())) {
+                    intptr_t x = acc.AsSmi();
+                    if (V12_LIKELY(SmiFitsFast(x + 1))) {
+                        acc = Value::FromSmi(x + 1);
+                        V12_DISPATCH();
+                    }
+                }
                 acc = Inc(iso_, acc);
-                break;
+                V12_DISPATCH();
             }
-            case Op::Dec: {
+            L_Dec: {
                 (void)ReadU16(&pc);
+                if (V12_LIKELY(acc.IsSmi())) {
+                    intptr_t x = acc.AsSmi();
+                    if (V12_LIKELY(SmiFitsFast(x - 1))) {
+                        acc = Value::FromSmi(x - 1);
+                        V12_DISPATCH();
+                    }
+                }
                 acc = Dec(iso_, acc);
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Control flow -----
             // Format: op  target:32
-            case Op::Jump: {
+            L_Jump: {
                 uint32_t target = ReadU32(&pc);
-                pc = info->bytecode.data() + target;
-                break;
+                pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfTrue: {
+            L_JumpIfTrue: {
                 uint32_t target = ReadU32(&pc);
-                if (IsTruthy(iso_, acc)) pc = info->bytecode.data() + target;
-                break;
+                if (IsTruthyFast(acc)) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfFalse: {
+            L_JumpIfFalse: {
                 uint32_t target = ReadU32(&pc);
-                if (!IsTruthy(iso_, acc)) pc = info->bytecode.data() + target;
-                break;
+                if (!IsTruthyFast(acc)) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfNull: {
+            L_JumpIfNull: {
                 uint32_t target = ReadU32(&pc);
-                if (acc.IsNull()) pc = info->bytecode.data() + target;
-                break;
+                if (acc.IsNull()) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfUndefined: {
+            L_JumpIfUndefined: {
                 uint32_t target = ReadU32(&pc);
-                if (acc.IsUndefined()) pc = info->bytecode.data() + target;
-                break;
+                if (acc.IsUndefined()) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfNotNullOrUndefined: {
+            L_JumpIfNotNullOrUndefined: {
                 uint32_t target = ReadU32(&pc);
-                if (!acc.IsNullOrUndefined()) pc = info->bytecode.data() + target;
-                break;
+                if (!acc.IsNullOrUndefined()) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfToBooleanTrue: {
+            L_JumpIfToBooleanTrue: {
                 uint32_t target = ReadU32(&pc);
-                if (IsTruthy(iso_, acc)) pc = info->bytecode.data() + target;
-                break;
+                if (IsTruthyFast(acc)) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpIfToBooleanFalse: {
+            L_JumpIfToBooleanFalse: {
                 uint32_t target = ReadU32(&pc);
-                if (!IsTruthy(iso_, acc)) pc = info->bytecode.data() + target;
-                break;
+                if (!IsTruthyFast(acc)) pc = bytecode_base + target;
+                V12_DISPATCH();
             }
-            case Op::JumpLoop: {
+            L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
-                pc = info->bytecode.data() + target;
-                break;
+                pc = bytecode_base + target;
+                V12_DISPATCH();
             }
 
             // ----- Property access -----
             // LoadProperty: op  name_idx:8  idx:16
-            case Op::LoadProperty: {
+            L_LoadProperty: {
                 uint8_t name_idx = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 std::string_view name = info->property_names[name_idx];
@@ -491,9 +632,9 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     acc = iso_->undefined_value();
                 }
-                break;
+                V12_DISPATCH();
             }
-            case Op::LoadIndexed: {
+            L_LoadIndexed: {
                 uint8_t idx_reg = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 Value idx_val = regs[idx_reg];
@@ -516,10 +657,10 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     acc = iso_->undefined_value();
                 }
-                break;
+                V12_DISPATCH();
             }
             // StoreProperty: op  val_reg:8  name_idx:8  idx:16
-            case Op::StoreProperty: {
+            L_StoreProperty: {
                 uint8_t val_reg = ReadU8(&pc);
                 uint8_t name_idx = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -528,9 +669,9 @@ InterpResult Interp::ExecuteTop() {
                 if (acc.IsObject()) {
                     acc.AsObject()->SetProperty(iso_, name, value);
                 }
-                break;
+                V12_DISPATCH();
             }
-            case Op::StoreIndexed: {
+            L_StoreIndexed: {
                 uint8_t idx_reg = ReadU8(&pc);
                 uint8_t val_reg = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -540,29 +681,29 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t idx = static_cast<uint32_t>(ToDouble(iso_, idx_val));
                     acc.AsArray()->SetElement(iso_, idx, value);
                 }
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Variables -----
             // LoadGlobal: op  name_idx:8  idx:16
-            case Op::LoadGlobal: {
+            L_LoadGlobal: {
                 uint8_t name_idx = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 std::string_view name = info->property_names[name_idx];
                 acc = iso_->GetGlobal(name);
-                break;
+                V12_DISPATCH();
             }
             // StoreGlobal: op  r:8  name_idx:8  idx:16
-            case Op::StoreGlobal: {
+            L_StoreGlobal: {
                 (void)ReadU8(&pc);   // dummy register
                 uint8_t name_idx = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 std::string_view name = info->property_names[name_idx];
                 iso_->SetGlobal(name, acc);
-                break;
+                V12_DISPATCH();
             }
             // LoadContext: op  depth:16  index:16  idx:16
-            case Op::LoadContext: {
+            L_LoadContext: {
                 uint16_t depth = ReadU16(&pc);
                 uint16_t index = ReadU16(&pc);
                 (void)ReadU16(&pc);
@@ -571,10 +712,10 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     acc = iso_->undefined_value();
                 }
-                break;
+                V12_DISPATCH();
             }
             // StoreContext: op  r:8  depth:16  index:16  idx:16
-            case Op::StoreContext: {
+            L_StoreContext: {
                 (void)ReadU8(&pc);
                 uint16_t depth = ReadU16(&pc);
                 uint16_t index = ReadU16(&pc);
@@ -582,7 +723,7 @@ InterpResult Interp::ExecuteTop() {
                 if (ctx != nullptr) {
                     ctx->StoreAt(depth, index, acc);
                 }
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Calls -----
@@ -592,10 +733,10 @@ InterpResult Interp::ExecuteTop() {
             //   acc holds the receiver; the property name is prop_idx.
             //   The interpreter looks up the property on acc to get the
             //   callee, then calls it with this = acc.
-            case Op::Call: {
+            L_Call: {
                 // Save the Call instruction's offset for handler lookup.
                 uint32_t call_off = static_cast<uint32_t>(
-                    (pc - info->bytecode.data()) - 1);
+                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -619,9 +760,9 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = exc;
-                        break;
+                        V12_DISPATCH();
                     }
                     return {InterpStatus::kThrew, exc};
                 }
@@ -630,20 +771,20 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = r.value;
-                        break;
+                        V12_DISPATCH();
                     }
                     return r;
                 }
                 sync();
                 pc = frame->pc;
                 acc = r.value;
-                break;
+                V12_DISPATCH();
             }
-            case Op::CallProperty: {
+            L_CallProperty: {
                 uint32_t call_off = static_cast<uint32_t>(
-                    (pc - info->bytecode.data()) - 1);
+                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t prop_idx = ReadU8(&pc);
                 uint8_t first_arg = ReadU8(&pc);
@@ -664,7 +805,7 @@ InterpResult Interp::ExecuteTop() {
                             receiver.AsArray()->Push(iso_, args[i]);
                         }
                         acc = Value::FromSmi(static_cast<intptr_t>(receiver.AsArray()->length()));
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "pop") {
                         JSArray* arr = receiver.AsArray();
                         if (arr->length() > 0) {
@@ -672,10 +813,10 @@ InterpResult Interp::ExecuteTop() {
                         } else {
                             acc = iso_->undefined_value();
                         }
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "length") {
                         acc = Value::FromSmi(static_cast<intptr_t>(receiver.AsArray()->length()));
-                        break;
+                        V12_DISPATCH();
                     }
                     callee = iso_->undefined_value();
                 } else if (receiver.IsString()) {
@@ -689,7 +830,7 @@ InterpResult Interp::ExecuteTop() {
                         } else {
                             acc = Value::FromHeap(JSString::New(iso_, ""));
                         }
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "substring" || method_name == "substr" ||
                                method_name == "slice") {
                         JSString* s = static_cast<JSString*>(receiver.AsHeapObject());
@@ -700,19 +841,19 @@ InterpResult Interp::ExecuteTop() {
                         if (start > end) { uint32_t t = start; start = end; end = t; }
                         acc = Value::FromHeap(JSString::New(iso_,
                             std::string_view(s->data() + start, end - start)));
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "toUpperCase") {
                         JSString* s = static_cast<JSString*>(receiver.AsHeapObject());
                         std::string out(s->data(), s->length());
                         for (auto& ch : out) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
                         acc = Value::FromHeap(JSString::New(iso_, out));
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "toLowerCase") {
                         JSString* s = static_cast<JSString*>(receiver.AsHeapObject());
                         std::string out(s->data(), s->length());
                         for (auto& ch : out) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                         acc = Value::FromHeap(JSString::New(iso_, out));
-                        break;
+                        V12_DISPATCH();
                     } else if (method_name == "indexOf") {
                         JSString* s = static_cast<JSString*>(receiver.AsHeapObject());
                         if (argc > 0 && args[0].IsString()) {
@@ -724,7 +865,7 @@ InterpResult Interp::ExecuteTop() {
                         } else {
                             acc = Value::FromSmi(-1);
                         }
-                        break;
+                        V12_DISPATCH();
                     }
                     callee = iso_->undefined_value();
                 } else {
@@ -739,9 +880,9 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = exc;
-                        break;
+                        V12_DISPATCH();
                     }
                     return {InterpStatus::kThrew, exc};
                 }
@@ -759,32 +900,35 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = r.value;
-                        break;
+                        V12_DISPATCH();
                     }
                     return r;
                 }
                 sync();
                 pc = frame->pc;
                 acc = r.value;
-                break;
+                V12_DISPATCH();
             }
-            case Op::Call0:
-            case Op::Call1:
-            case Op::Call2: {
+            L_Call0:
+            L_Call1:
+            L_Call2: {
                 uint32_t call_off = static_cast<uint32_t>(
-                    (pc - info->bytecode.data()) - 1);
+                    (pc - bytecode_base) - 1);
+                // Determine which variant (Call0/1/2) by looking at the
+                // opcode byte we just consumed (pc[-1]).
+                uint8_t opcode_byte = pc[-1];
                 Value callee = acc;
                 Value this_val = iso_->undefined_value();
                 Value argbuf[2];
                 uint32_t argc = 0;
-                if (op == Op::Call1) {
+                if (opcode_byte == static_cast<uint8_t>(Op::Call1)) {
                     uint8_t r = ReadU8(&pc);
                     (void)ReadU16(&pc);
                     argbuf[0] = regs[r];
                     argc = 1;
-                } else if (op == Op::Call2) {
+                } else if (opcode_byte == static_cast<uint8_t>(Op::Call2)) {
                     uint8_t r1 = ReadU8(&pc);
                     uint8_t r2 = ReadU8(&pc);
                     (void)ReadU16(&pc);
@@ -810,9 +954,9 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = exc;
-                        break;
+                        V12_DISPATCH();
                     }
                     return {InterpStatus::kThrew, exc};
                 }
@@ -822,20 +966,20 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = r.value;
-                        break;
+                        V12_DISPATCH();
                     }
                     return r;
                 }
                 sync();
                 pc = frame->pc;
                 acc = r.value;
-                break;
+                V12_DISPATCH();
             }
-            case Op::Construct: {
+            L_Construct: {
                 uint32_t call_off = static_cast<uint32_t>(
-                    (pc - info->bytecode.data()) - 1);
+                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -856,9 +1000,9 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = exc;
-                        break;
+                        V12_DISPATCH();
                     }
                     return {InterpStatus::kThrew, exc};
                 }
@@ -868,9 +1012,9 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
-                        pc = info->bytecode.data() + catch_off;
+                        pc = bytecode_base + catch_off;
                         acc = r.value;
-                        break;
+                        V12_DISPATCH();
                     }
                     return r;
                 }
@@ -881,27 +1025,27 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     acc = new_obj;
                 }
-                break;
+                V12_DISPATCH();
             }
-            case Op::CallBuiltin: {
+            L_CallBuiltin: {
                 (void)ReadU8(&pc);
                 (void)ReadU16(&pc);
                 (void)ReadU8(&pc);
                 acc = iso_->undefined_value();
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Object / array creation -----
-            case Op::NewObject:
+            L_NewObject:
                 acc = Value::FromHeap(JSObject::New(iso_));
-                break;
-            case Op::NewArray: {
+                V12_DISPATCH();
+            L_NewArray: {
                 uint16_t cap = ReadU16(&pc);
                 acc = Value::FromHeap(JSArray::New(iso_, cap));
-                break;
+                V12_DISPATCH();
             }
             // DefineProperty: op  val_reg:8  name_idx:8
-            case Op::DefineProperty: {
+            L_DefineProperty: {
                 uint8_t val_reg = ReadU8(&pc);
                 uint8_t name_idx = ReadU8(&pc);
                 std::string_view name = info->property_names[name_idx];
@@ -909,74 +1053,74 @@ InterpResult Interp::ExecuteTop() {
                 if (acc.IsObject()) {
                     acc.AsObject()->SetProperty(iso_, name, value);
                 }
-                break;
+                V12_DISPATCH();
             }
             // CreateClosure: op  const_idx:32
-            case Op::CreateClosure: {
+            L_CreateClosure: {
                 uint32_t cidx = ReadU32(&pc);
                 V12_CHECK(current_program_ != nullptr, "no current program");
                 const Constant& c = info->constants[cidx];
                 V12_DCHECK(c.kind == Constant::Kind::kFunctionInfo, "not a function constant");
                 FunctionInfo* inner_info = current_program_->functions[c.index].get();
                 acc = Value::FromHeap(JSFunction::New(iso_, inner_info, ctx));
-                break;
+                V12_DISPATCH();
             }
             // PushArray: op  arr_reg:8  idx:16
-            case Op::PushArray: {
+            L_PushArray: {
                 uint8_t arr_reg = ReadU8(&pc);
                 (void)ReadU16(&pc);
                 Value arr = regs[arr_reg];
                 if (arr.IsArray()) {
                     arr.AsArray()->Push(iso_, acc);
                 }
-                break;
+                V12_DISPATCH();
             }
             // LoadArrayLength: op  idx:16
-            case Op::LoadArrayLength: {
+            L_LoadArrayLength: {
                 (void)ReadU16(&pc);
                 if (acc.IsArray()) {
                     acc = Value::FromSmi(static_cast<intptr_t>(acc.AsArray()->length()));
                 } else {
                     acc = iso_->undefined_value();
                 }
-                break;
+                V12_DISPATCH();
             }
-            case Op::StoreArrayLength: {
+            L_StoreArrayLength: {
                 (void)ReadU8(&pc);
                 (void)ReadU16(&pc);
                 // Setting .length is a no-op for now.
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Context allocation -----
             // CreateContext: op  slot_count:16  idx:16
-            case Op::CreateContext: {
+            L_CreateContext: {
                 uint16_t slot_count = ReadU16(&pc);
                 (void)ReadU16(&pc);
                 acc = Value::FromHeap(Context::New(iso_, ctx, slot_count));
-                break;
+                V12_DISPATCH();
             }
             // PushContext: op  idx:16
-            case Op::PushContext: {
+            L_PushContext: {
                 (void)ReadU16(&pc);
                 if (acc.IsHeapObject()) {
                     ctx = static_cast<Context*>(acc.AsHeapObject());
                     frame->context = ctx;
                 }
-                break;
+                V12_DISPATCH();
             }
             // PopContext: op  idx:16
-            case Op::PopContext: {
+            L_PopContext: {
                 (void)ReadU16(&pc);
                 if (ctx != nullptr) {
                     ctx = ctx->parent();
                     frame->context = ctx;
                 }
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Iteration -----
-            case Op::ObjectKeys: {
+            L_ObjectKeys: {
                 (void)ReadU16(&pc);
                 // Create an array of property name strings from acc.
                 JSArray* arr = JSArray::New(iso_, 4);
@@ -997,95 +1141,91 @@ InterpResult Interp::ExecuteTop() {
                     }
                 }
                 acc = Value::FromHeap(arr);
-                break;
+                V12_DISPATCH();
             }
-            case Op::GetIterator: {
+            L_GetIterator: {
                 (void)ReadU16(&pc);
                 // For arrays and strings, the receiver itself is the
                 // "iterator" (for-of uses indexed access with a counter).
                 // No transformation needed.
-                break;
+                V12_DISPATCH();
             }
-            case Op::ForInPrepare: {
+            L_ForInPrepare: {
                 (void)ReadU8(&pc);
                 acc = iso_->undefined_value();
-                break;
+                V12_DISPATCH();
             }
-            case Op::ForInNext: {
+            L_ForInNext: {
                 (void)ReadU8(&pc);
                 (void)ReadU8(&pc);
                 acc = iso_->undefined_value();
-                break;
+                V12_DISPATCH();
             }
-            case Op::ForInDone: {
+            L_ForInDone: {
                 (void)ReadU8(&pc);
                 acc = iso_->true_value();
-                break;
+                V12_DISPATCH();
             }
 
             // ----- Returns -----
-            case Op::Return:
+            L_Return:
                 frame->pc = pc;
                 return {InterpStatus::kReturned, acc};
-            case Op::ReturnUndefined:
+            L_ReturnUndefined:
                 frame->pc = pc;
                 return {InterpStatus::kReturned, iso_->undefined_value()};
 
             // ----- Exceptions -----
-            case Op::Throw: {
+            L_Throw: {
                 pending_exception_ = acc;
                 frame->pc = pc;
                 // Search for a handler in the current function. Use the
                 // offset of the Throw instruction itself (pc has already
                 // advanced past the opcode byte).
                 uint32_t throw_off = static_cast<uint32_t>(
-                    (pc - info->bytecode.data()) - 1);
+                    (pc - bytecode_base) - 1);
                 uint32_t catch_off = info->FindHandler(throw_off);
                 if (catch_off != 0xFFFFFFFF) {
-                    pc = info->bytecode.data() + catch_off;
+                    pc = bytecode_base + catch_off;
                     acc = pending_exception_;
-                    break;
+                    V12_DISPATCH();
                 }
                 return {InterpStatus::kThrew, acc};
             }
-            case Op::TryCatch: {
+            L_TryCatch: {
                 // No-op: the handler table is static (in FunctionInfo).
                 (void)ReadU32(&pc);
-                break;
+                V12_DISPATCH();
             }
-            case Op::TryFinally: {
+            L_TryFinally: {
                 // Not yet fully implemented.
                 (void)ReadU32(&pc);
                 (void)ReadU32(&pc);
-                break;
+                V12_DISPATCH();
             }
-            case Op::Exception:
+            L_Exception:
                 acc = pending_exception_;
-                break;
+                V12_DISPATCH();
 
             // ----- Debugger -----
-            case Op::Debugger:
+            L_Debugger:
                 // No-op in non-debug builds.
-                break;
+                V12_DISPATCH();
 
             // ----- Misc -----
-            case Op::Pop:
+            L_Pop:
                 acc = iso_->undefined_value();
-                break;
-            case Op::Dup:
+                V12_DISPATCH();
+            L_Dup:
                 // No-op (acc is already acc).
-                break;
-            case Op::Nop:
-                break;
-            case Op::Illegal:
+                V12_DISPATCH();
+            L_Nop:
+                V12_DISPATCH();
+            L_Illegal:
                 V12_CHECK(false, "Illegal bytecode executed");
-                break;
-
-            default:
-                V12_CHECK(false, "unknown opcode %d", static_cast<int>(op));
-                break;
-        }
-    }
+                V12_DISPATCH();
+    // Unreachable — every opcode has a label above.
+    return {InterpStatus::kReturned, iso_->undefined_value()};
 }
 
 }  // namespace v12

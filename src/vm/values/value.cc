@@ -1,10 +1,17 @@
 // =============================================================================
 // src/vm/values/value.cc
 // =============================================================================
+// Non-inline Value and HeapObject methods.
+//
+// The hot Is*() type checks are inlined in value.h (they read the cached
+// HeapObjectKind from the header — no Shape dereference). This file
+// contains only the cold-path methods: As*() casts (with DCHECKs),
+// HeapObjectKindName, HeapObject::shape(), and HeapObject::set_shape().
 
 #include "vm/values/value.h"
 
 #include "vm/objects/object.h"
+#include "vm/shapes/shape.h"
 
 namespace v12 {
 
@@ -32,18 +39,12 @@ const char* HeapObjectKindName(HeapObjectKind kind) {
     return "<unknown>";
 }
 
-HeapObjectKind HeapObject::kind() const {
-    return shape()->object_kind();
-}
-
-Shape* HeapObject::shape() const {
-    // Mask off the low 2 mark bits.
-    return reinterpret_cast<Shape*>(shape_and_mark_ & ~uintptr_t{3});
-}
-
 void HeapObject::set_shape(Shape* s) {
     uintptr_t mark = shape_and_mark_ & 3;
     shape_and_mark_ = reinterpret_cast<uintptr_t>(s) | mark;
+    // Cache the shape's object_kind() in the header so that future kind()
+    // calls don't need to dereference the shape pointer.
+    kind_ = s->object_kind();
 }
 
 JSObject* HeapObject::AsObject() {
@@ -61,40 +62,6 @@ JSString* HeapObject::AsString() {
 JSFunction* HeapObject::AsFunction() {
     V12_DCHECK(kind() == HeapObjectKind::kFunction, "AsFunction on non-function");
     return static_cast<JSFunction*>(this);
-}
-
-bool Value::IsNumber() const {
-    if (IsSmi()) return true;
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kNumber;
-}
-bool Value::IsString() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kString;
-}
-bool Value::IsObject() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kObject;
-}
-bool Value::IsArray() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kArray;
-}
-bool Value::IsFunction() const {
-    if (!IsHeapObject()) return false;
-    HeapObjectKind k = AsHeapObject()->kind();
-    return k == HeapObjectKind::kFunction || k == HeapObjectKind::kExternal;
-}
-bool Value::IsHostFunction() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kExternal;
-}
-bool Value::IsBoolean() const {
-    if (IsHeapObject()) {
-        return AsHeapObject()->kind() == HeapObjectKind::kBoolean;
-    }
-    return false;
-}
-bool Value::IsUndefined() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kUndefined;
-}
-bool Value::IsNull() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kNull;
 }
 
 double Value::AsNumber() const {

@@ -538,4 +538,27 @@ bool IsTruthy(Isolate* iso, Value v) {
     return ToBoolean(iso, v).AsHeapObject() == iso->true_object();
 }
 
+bool IsTruthyFast(Value v) {
+    if (v.IsSmi()) return v.AsSmi() != 0;
+    if (v.IsHeapObject()) {
+        HeapObject* h = v.AsHeapObject();
+        switch (h->kind()) {
+            case HeapObjectKind::kUndefined:
+            case HeapObjectKind::kNull:
+                return false;
+            case HeapObjectKind::kBoolean:
+                return static_cast<JSBoolean*>(h)->value();
+            case HeapObjectKind::kNumber: {
+                double d = static_cast<JSNumber*>(h)->value();
+                return d != 0.0 && !std::isnan(d);
+            }
+            case HeapObjectKind::kString:
+                return static_cast<JSString*>(h)->length() != 0;
+            default:
+                return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace v12
