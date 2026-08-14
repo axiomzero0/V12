@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Crash dumps
+crashes/
+core
+core.*
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+
+# Valgrind
+vgcore.*
+callgrind.out.*
