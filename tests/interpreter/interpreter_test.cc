@@ -339,3 +339,169 @@ TEST(Interpreter, PrefixIncrement) {
     EXPECT_EQ(h.output()[0], "6");
     EXPECT_EQ(h.output()[1], "6");
 }
+
+// =============================================================================
+// Closures
+// =============================================================================
+TEST(Interpreter, ClosureCounter) {
+    InterpHarness h;
+    h.Run("function makeCounter() { let count = 0; return function() { count++; return count; }; } "
+          "let c = makeCounter(); print(c()); print(c()); print(c());");
+    ASSERT_EQ(h.output().size(), 3u);
+    EXPECT_EQ(h.output()[0], "1");
+    EXPECT_EQ(h.output()[1], "2");
+    EXPECT_EQ(h.output()[2], "3");
+}
+
+TEST(Interpreter, ClosureCaptureParam) {
+    InterpHarness h;
+    h.Run("function adder(x) { return function(y) { return x + y; }; } "
+          "let add5 = adder(5); print(add5(3)); print(add5(10));");
+    ASSERT_EQ(h.output().size(), 2u);
+    EXPECT_EQ(h.output()[0], "8");
+    EXPECT_EQ(h.output()[1], "15");
+}
+
+TEST(Interpreter, ClosureMultipleCaptures) {
+    InterpHarness h;
+    h.Run("function makePair(a, b) { return function() { return a + b; }; } "
+          "print(makePair(10, 20)());");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "30");
+}
+
+TEST(Interpreter, ClosureSharedState) {
+    InterpHarness h;
+    h.Run("function makeAcc() { let total = 0; "
+          "  function add(x) { total += x; return total; } "
+          "  return add; } "
+          "let acc = makeAcc(); "
+          "print(acc(10)); print(acc(20)); print(acc(30));");
+    ASSERT_EQ(h.output().size(), 3u);
+    EXPECT_EQ(h.output()[0], "10");
+    EXPECT_EQ(h.output()[1], "30");
+    EXPECT_EQ(h.output()[2], "60");
+}
+
+// =============================================================================
+// Try/Catch
+// =============================================================================
+TEST(Interpreter, TryCatchString) {
+    InterpHarness h;
+    h.Run("try { throw \"oops\"; } catch (e) { print(\"caught:\", e); }");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "caught: oops");
+}
+
+TEST(Interpreter, TryCatchNumber) {
+    InterpHarness h;
+    h.Run("try { throw 42; } catch (e) { print(\"caught:\", e); }");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "caught: 42");
+}
+
+TEST(Interpreter, TryCatchNoThrow) {
+    InterpHarness h;
+    h.Run("try { print(\"in try\"); } catch (e) { print(\"should not catch\"); } print(\"after\");");
+    ASSERT_EQ(h.output().size(), 2u);
+    EXPECT_EQ(h.output()[0], "in try");
+    EXPECT_EQ(h.output()[1], "after");
+}
+
+TEST(Interpreter, TryCatchNested) {
+    InterpHarness h;
+    h.Run("try { throw \"inner\"; } catch (e) { print(e); "
+          "  try { throw \"nested\"; } catch (e2) { print(e2); } }");
+    ASSERT_EQ(h.output().size(), 2u);
+    EXPECT_EQ(h.output()[0], "inner");
+    EXPECT_EQ(h.output()[1], "nested");
+}
+
+TEST(Interpreter, TryCatchFromFunction) {
+    InterpHarness h;
+    h.Run("function risky() { throw \"from function\"; } "
+          "try { risky(); } catch (e) { print(\"caught:\", e); }");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "caught: from function");
+}
+
+TEST(Interpreter, TryCatchNoParam) {
+    InterpHarness h;
+    h.Run("try { throw 123; } catch { print(\"caught no param\"); }");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "caught no param");
+}
+
+// =============================================================================
+// For-in
+// =============================================================================
+TEST(Interpreter, ForInObject) {
+    InterpHarness h;
+    h.Run("let obj = { a: 1, b: 2, c: 3 }; "
+          "for (let k in obj) { print(k, obj[k]); }");
+    ASSERT_EQ(h.output().size(), 3u);
+    EXPECT_EQ(h.output()[0], "a 1");
+    EXPECT_EQ(h.output()[1], "b 2");
+    EXPECT_EQ(h.output()[2], "c 3");
+}
+
+// =============================================================================
+// For-of
+// =============================================================================
+TEST(Interpreter, ForOfArray) {
+    InterpHarness h;
+    h.Run("let arr = [10, 20, 30]; for (let v of arr) { print(v); }");
+    ASSERT_EQ(h.output().size(), 3u);
+    EXPECT_EQ(h.output()[0], "10");
+    EXPECT_EQ(h.output()[1], "20");
+    EXPECT_EQ(h.output()[2], "30");
+}
+
+TEST(Interpreter, ForOfString) {
+    InterpHarness h;
+    h.Run("for (let c of \"abc\") { print(c); }");
+    ASSERT_EQ(h.output().size(), 3u);
+    EXPECT_EQ(h.output()[0], "a");
+    EXPECT_EQ(h.output()[1], "b");
+    EXPECT_EQ(h.output()[2], "c");
+}
+
+// =============================================================================
+// String methods
+// =============================================================================
+TEST(Interpreter, StringToUpperCase) {
+    InterpHarness h;
+    h.Run("print(\"hello\".toUpperCase());");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "HELLO");
+}
+
+TEST(Interpreter, StringToLowerCase) {
+    InterpHarness h;
+    h.Run("print(\"WORLD\".toLowerCase());");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "world");
+}
+
+TEST(Interpreter, StringSubstring) {
+    InterpHarness h;
+    h.Run("print(\"hello world\".substring(0, 5));");
+    ASSERT_EQ(h.output().size(), 1u);
+    EXPECT_EQ(h.output()[0], "hello");
+}
+
+TEST(Interpreter, StringCharAt) {
+    InterpHarness h;
+    h.Run("print(\"abc\".charAt(1)); print(\"abc\".charAt(10));");
+    ASSERT_EQ(h.output().size(), 2u);
+    EXPECT_EQ(h.output()[0], "b");
+    EXPECT_EQ(h.output()[1], "");
+}
+
+TEST(Interpreter, StringIndexOf) {
+    InterpHarness h;
+    h.Run("print(\"hello world\".indexOf(\"world\")); print(\"hello\".indexOf(\"xyz\"));");
+    ASSERT_EQ(h.output().size(), 2u);
+    EXPECT_EQ(h.output()[0], "6");
+    EXPECT_EQ(h.output()[1], "-1");
+}

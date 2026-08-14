@@ -63,6 +63,14 @@ void DumpFunction(FunctionInfo* fi, int indent) {
             }
         }
     }
+    if (!fi->handlers.empty()) {
+        std::fprintf(stderr, "%*s  handlers:\n", indent, "");
+        for (size_t i = 0; i < fi->handlers.size(); ++i) {
+            const auto& h = fi->handlers[i];
+            std::fprintf(stderr, "%*s    [%zu] try=[%u,%u) catch=%u\n",
+                         indent, "", i, h.try_start, h.try_end, h.catch_start);
+        }
+    }
     std::fprintf(stderr, "%*s  bytecode (size=%zu):\n", indent, "", fi->bytecode.size());
     size_t i = 0;
     while (i < fi->bytecode.size()) {

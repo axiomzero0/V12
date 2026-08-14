@@ -73,8 +73,17 @@ ar rcs "${BUILD_DIR}/libv12.a" ${OBJ_FILES}
 
 # Build tools.
 echo "==> Building tools..."
-for tool_src in "${TOOLS_DIR}"/js-shell/js-shell.cc \
-                "${TOOLS_DIR}"/bytecode-dump/bytecode-dump.cc \
+
+# js-shell needs builtins.cc compiled in.
+echo "  LD  js-shell"
+${CXX} ${CXXFLAGS} ${LDFLAGS:-} \
+    "${TOOLS_DIR}/js-shell/js-shell.cc" \
+    "${TOOLS_DIR}/js-shell/builtins.cc" \
+    -o "${BUILD_DIR}/bin/js-shell" \
+    -L"${BUILD_DIR}" -lv12 -lpthread || echo "    (failed, continuing)"
+
+# Other tools are single-file.
+for tool_src in "${TOOLS_DIR}"/bytecode-dump/bytecode-dump.cc \
                 "${TOOLS_DIR}"/ir-dump/ir-dump.cc; do
     if [ -f "${tool_src}" ]; then
         tool_name=$(basename "${tool_src}" .cc)

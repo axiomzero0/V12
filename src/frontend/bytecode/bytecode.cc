@@ -107,6 +107,9 @@ constexpr OpInfo kOpInfos[] = {
     {Op::PushContext,        "PushContext",        OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
     {Op::PopContext,         "PopContext",         OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
 
+    {Op::ObjectKeys,         "ObjectKeys",         OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
+    {Op::GetIterator,        "GetIterator",        OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
+
     {Op::ForInPrepare,       "ForInPrepare",       OperandKind::kReg,      OperandKind::kNone, OperandKind::kNone, 2},
     {Op::ForInNext,          "ForInNext",          OperandKind::kReg,      OperandKind::kReg,  OperandKind::kNone, 3},
     {Op::ForInDone,          "ForInDone",          OperandKind::kReg,      OperandKind::kNone, OperandKind::kNone, 2},

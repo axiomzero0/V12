@@ -165,6 +165,12 @@ enum class Op : uint8_t {
     PushContext,        // current = acc  (set the running frame's context)
     PopContext,         // current = current.parent  (restore prior context)
 
+    // Iteration helpers
+    ObjectKeys,         // acc = array of key strings from acc (object)
+    GetIterator,        // acc = iterator for acc (array/string) — returns the
+                        // receiver itself for arrays/strings (for-of uses
+                        // indexed access with a counter)
+
     // Iteration
     ForInPrepare,
     ForInNext,
@@ -254,6 +260,30 @@ struct FunctionInfo {
         uint32_t column;
     };
     std::vector<SourcePosition> source_positions;
+
+    // ----- Exception handler table -----
+    // Maps a bytecode range (the try block) to a catch handler offset.
+    // When an exception is thrown, the interpreter searches this table
+    // for an entry whose [try_start, try_end) range contains the current
+    // PC. If found, execution jumps to catch_start with the exception in
+    // the accumulator.
+    struct HandlerEntry {
+        uint32_t try_start;    // bytecode offset of the try block start
+        uint32_t try_end;      // bytecode offset just past the try block
+        uint32_t catch_start;  // bytecode offset of the catch handler
+    };
+    std::vector<HandlerEntry> handlers;
+
+    // Search the handler table for an entry containing `pc_offset`.
+    // Returns the catch_start offset, or 0xFFFFFFFF if not found.
+    uint32_t FindHandler(uint32_t pc_offset) const {
+        for (const auto& h : handlers) {
+            if (pc_offset >= h.try_start && pc_offset < h.try_end) {
+                return h.catch_start;
+            }
+        }
+        return 0xFFFFFFFF;
+    }
 
     // Look up a constant's Value at runtime. Returns the appropriate Value
     // (Smi, HeapNumber, JSString, etc.) given an Isolate.

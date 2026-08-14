@@ -44,7 +44,9 @@ std::unique_ptr<BytecodeProgram> BytecodeGenerator::Compile(Program* prog) {
     top_fs.info = program_->NewFunction("<toplevel>");
     top_fs.info->is_toplevel = true;
     top_fs.scope = scope_analyzer_->global_scope();
-    top_fs.next_temp = 0;
+    // The global scope has no local variables (all globals), so next_local()
+    // is 0. Start temps at 0.
+    top_fs.next_temp = scope_analyzer_->global_scope()->next_local();
 
     // Compile each top-level statement.
     for (Stmt* s : prog->body) {
@@ -247,38 +249,47 @@ FunctionInfo* BytecodeGenerator::CompileFunction(FnState* parent_fs,
     FnState fs;
     fs.info = fi;
     fs.scope = fn_scope;
-    // Parameters occupy registers 0..N-1.
-    fs.next_temp = static_cast<uint8_t>(params.size());
+    // Initialize the temp register counter to start AFTER all local variables
+    // (parameters + locals + block-scoped variables). The scope analyzer has
+    // already assigned registers to all declared variables via AllocLocal/
+    // AllocBlockLocal, so fn_scope->next_local() is the first free register
+    // for temps. This prevents register collisions between locals and temps.
+    fs.next_temp = fn_scope->next_local();
 
-    // Assign context slot indices for captured variables declared in this
-    // function's scope. Walk fn_scope->bindings(); each binding with
-    // is_captured=true gets a context slot.
-    uint16_t ctx_slot = 0;
-    for (auto& b : fn_scope->bindings()) {
-        if (b.is_captured) {
-            const_cast<Binding&>(b).context_index = ctx_slot++;
-        }
-    }
-    fi->num_context_vars = ctx_slot;
+    // The scope analyzer has already assigned context slot indices to all
+    // captured variables (both function-scoped and block-scoped) via
+    // MarkCaptured. The total count is in fn_scope->num_context_vars().
+    fi->num_context_vars = fn_scope->num_context_vars();
 
     // If this function has captured variables, emit a CreateContext at
     // function entry. The new context becomes the running context for
     // the body. We also stash the parent's context by linking it.
-    if (ctx_slot > 0) {
+    if (fi->num_context_vars > 0) {
         // CreateContext imm16 slot_count, idx
         EmitOp(&fs, Op::CreateContext);
-        EmitImm16(&fs, ctx_slot);
+        EmitImm16(&fs, fi->num_context_vars);
         EmitIdx(&fs, AllocFeedbackSlot(&fs));
         // The new context is in acc. Push it as the current context.
         EmitOp(&fs, Op::PushContext);
         EmitIdx(&fs, AllocFeedbackSlot(&fs));
-        // Copy captured variables from their parent-context slots into
-        // the new context. For variables declared *in this function*
-        // that are captured, they start as locals — the body will
-        // write to them via StoreContext, which writes to the local
-        // context. So no copy is needed at function entry.
-        // (Variables captured from enclosing functions are read via the
-        //  parent context link; no copy needed.)
+        // Copy captured PARAMETERS from their registers into the context.
+        // Parameters are initialized by the caller in registers 0..N-1, but
+        // captured parameters need to also be in the context slot so that
+        // inner closures can read them. Local variables (let/const/var) are
+        // written to the context via StoreContext as part of their
+        // initializer, so they don't need copying here.
+        for (auto& b : fn_scope->bindings()) {
+            if (b.is_captured && b.reg < static_cast<uint8_t>(params.size())) {
+                // This is a captured parameter. Copy it to its context slot.
+                EmitOp(&fs, Op::Ldar);
+                EmitReg(&fs, b.reg);
+                EmitOp(&fs, Op::StoreContext);
+                EmitReg(&fs, 0);   // dummy
+                EmitImm16(&fs, 0); // depth 0 (current context)
+                EmitImm16(&fs, b.context_index);
+                EmitIdx(&fs, AllocFeedbackSlot(&fs));
+            }
+        }
     }
 
     // Initialize parameters: each parameter already lives in its assigned
@@ -478,11 +489,206 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
             EmitExpr(fs, es->expr);
             break;
         }
-        case AstKind::kTry:
+        case AstKind::kTry: {
+            Try* t = static_cast<Try*>(s);
+            // Record the try block start offset.
+            uint32_t try_start = Here(fs);
+            // Compile the try block.
+            EmitStmt(fs, t->block);
+            uint32_t try_end = Here(fs);
+            // After the try block completes normally, jump past the catch.
+            uint32_t jmp_past_catch = 0;
+            if (t->catch_clause) {
+                jmp_past_catch = EmitJump(fs, Op::Jump);
+            }
+            // Record the catch handler start offset and compile the catch block.
+            if (t->catch_clause) {
+                uint32_t catch_start = Here(fs);
+                // Switch to the catch body's scope BEFORE binding the
+                // exception variable, so that EmitStoreIdentifier resolves
+                // `e` in the catch scope (not the enclosing scope).
+                Scope* catch_scope = scope_analyzer_->GetScope(t->catch_clause->body);
+                Scope* saved = nullptr;
+                if (catch_scope != nullptr && catch_scope != fs->scope) {
+                    saved = fs->scope;
+                    fs->scope = catch_scope;
+                }
+                // Bind the exception variable (if any) to acc.
+                if (!t->catch_clause->param.empty()) {
+                    Identifier id(t->catch_clause->range, t->catch_clause->param);
+                    EmitStoreIdentifier(fs, &id);
+                }
+                EmitStmt(fs, t->catch_clause->body);
+                if (saved != nullptr) fs->scope = saved;
+                // Add the handler table entry.
+                FunctionInfo::HandlerEntry he;
+                he.try_start = try_start;
+                he.try_end = try_end;
+                he.catch_start = catch_start;
+                fs->info->handlers.push_back(he);
+                // Patch the jump-past-catch.
+                PatchJump(fs, jmp_past_catch, Here(fs));
+            }
+            // Finally block (if any) — not yet fully implemented. For now,
+            // emit it inline after the catch.
+            if (t->finally_block) {
+                EmitStmt(fs, t->finally_block);
+            }
+            break;
+        }
+        case AstKind::kForIn: {
+            ForIn* fi = static_cast<ForIn*>(s);
+            // Evaluate the object expression.
+            EmitExpr(fs, fi->right);
+            // Get the keys as an array.
+            EmitOp(fs, Op::ObjectKeys);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            // Store the keys array in a temp.
+            uint8_t keys_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, keys_tmp);
+            // Initialize counter = 0.
+            uint8_t counter_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::LdaZero);
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, counter_tmp);
+            // Loop start.
+            uint32_t loop_start = Here(fs);
+            fs->loops.push_back({{}, {}, loop_start});
+            // Check counter < keys.length.
+            // acc = counter, then compare with keys.length.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, counter_tmp);
+            // Need keys.length in a temp to use TestLessThan (acc < reg).
+            uint8_t len_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, keys_tmp);
+            EmitOp(fs, Op::LoadArrayLength);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, len_tmp);
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, counter_tmp);
+            EmitOp(fs, Op::TestLessThan);
+            EmitReg(fs, len_tmp);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            uint32_t jmp_end = EmitJump(fs, Op::JumpIfFalse);
+            // Load keys[counter] into acc.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, keys_tmp);
+            EmitOp(fs, Op::LoadIndexed);
+            EmitReg(fs, counter_tmp);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            // Store to the loop variable.
+            if (fi->left->kind == AstKind::kVarDecl ||
+                fi->left->kind == AstKind::kLetDecl ||
+                fi->left->kind == AstKind::kConstDecl) {
+                VarDeclStmt* vd = static_cast<VarDeclStmt*>(fi->left);
+                if (!vd->declarations.empty()) {
+                    Identifier id(vd->declarations[0].range, vd->declarations[0].name);
+                    EmitStoreIdentifier(fs, &id);
+                }
+            } else if (fi->left->kind == AstKind::kExpressionStatement) {
+                Expr* expr = static_cast<ExpressionStatement*>(fi->left)->expr;
+                if (expr->kind == AstKind::kIdentifier) {
+                    EmitStoreIdentifier(fs, static_cast<Identifier*>(expr));
+                }
+            }
+            // Body.
+            EmitStmt(fs, fi->body);
+            // Increment counter.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, counter_tmp);
+            EmitOp(fs, Op::Inc);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, counter_tmp);
+            // Back-edge.
+            EmitOp(fs, Op::JumpLoop);
+            EmitImm32(fs, loop_start);
+            // Loop end.
+            uint32_t loop_end = Here(fs);
+            PatchJump(fs, jmp_end, loop_end);
+            for (uint32_t b : fs->loops.back().breaks) PatchJump(fs, b, loop_end);
+            for (uint32_t c : fs->loops.back().continues) PatchJump(fs, c, loop_start);
+            fs->loops.pop_back();
+            break;
+        }
+        case AstKind::kForOf: {
+            ForOf* fo = static_cast<ForOf*>(s);
+            // Evaluate the iterable expression.
+            EmitExpr(fs, fo->right);
+            // Store the iterable in a temp.
+            uint8_t iter_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, iter_tmp);
+            // Initialize counter = 0.
+            uint8_t counter_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::LdaZero);
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, counter_tmp);
+            // Loop start.
+            uint32_t loop_start = Here(fs);
+            fs->loops.push_back({{}, {}, loop_start});
+            // Get iter.length into a temp.
+            uint8_t len_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, iter_tmp);
+            EmitOp(fs, Op::LoadProperty);
+            EmitReg(fs, AddPropertyName(fs, "length"));
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, len_tmp);
+            // Check counter < iter.length.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, counter_tmp);
+            EmitOp(fs, Op::TestLessThan);
+            EmitReg(fs, len_tmp);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            uint32_t jmp_end = EmitJump(fs, Op::JumpIfFalse);
+            // Load iter[counter] into acc.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, iter_tmp);
+            EmitOp(fs, Op::LoadIndexed);
+            EmitReg(fs, counter_tmp);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            // Store to the loop variable.
+            if (fo->left->kind == AstKind::kVarDecl ||
+                fo->left->kind == AstKind::kLetDecl ||
+                fo->left->kind == AstKind::kConstDecl) {
+                VarDeclStmt* vd = static_cast<VarDeclStmt*>(fo->left);
+                if (!vd->declarations.empty()) {
+                    Identifier id(vd->declarations[0].range, vd->declarations[0].name);
+                    EmitStoreIdentifier(fs, &id);
+                }
+            } else if (fo->left->kind == AstKind::kExpressionStatement) {
+                Expr* expr = static_cast<ExpressionStatement*>(fo->left)->expr;
+                if (expr->kind == AstKind::kIdentifier) {
+                    EmitStoreIdentifier(fs, static_cast<Identifier*>(expr));
+                }
+            }
+            // Body.
+            EmitStmt(fs, fo->body);
+            // Increment counter.
+            EmitOp(fs, Op::Ldar);
+            EmitReg(fs, counter_tmp);
+            EmitOp(fs, Op::Inc);
+            EmitIdx(fs, AllocFeedbackSlot(fs));
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, counter_tmp);
+            // Back-edge.
+            EmitOp(fs, Op::JumpLoop);
+            EmitImm32(fs, loop_start);
+            // Loop end.
+            uint32_t loop_end = Here(fs);
+            PatchJump(fs, jmp_end, loop_end);
+            for (uint32_t b : fs->loops.back().breaks) PatchJump(fs, b, loop_end);
+            for (uint32_t c : fs->loops.back().continues) PatchJump(fs, c, loop_start);
+            fs->loops.pop_back();
+            break;
+        }
         case AstKind::kSwitch:
         case AstKind::kLabeled:
-        case AstKind::kForIn:
-        case AstKind::kForOf:
             // Not yet implemented; emit a nop.
             EmitOp(fs, Op::Nop);
             break;

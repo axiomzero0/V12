@@ -593,6 +593,9 @@ InterpResult Interp::ExecuteTop() {
             //   The interpreter looks up the property on acc to get the
             //   callee, then calls it with this = acc.
             case Op::Call: {
+                // Save the Call instruction's offset for handler lookup.
+                uint32_t call_off = static_cast<uint32_t>(
+                    (pc - info->bytecode.data()) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -613,10 +616,24 @@ InterpResult Interp::ExecuteTop() {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
                     pending_exception_ = exc;
+                    uint32_t catch_off = info->FindHandler(call_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = exc;
+                        break;
+                    }
                     return {InterpStatus::kThrew, exc};
                 }
                 if (r.status == InterpStatus::kThrew) {
                     pending_exception_ = r.value;
+                    uint32_t catch_off = info->FindHandler(call_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = r.value;
+                        break;
+                    }
                     return r;
                 }
                 sync();
@@ -625,6 +642,8 @@ InterpResult Interp::ExecuteTop() {
                 break;
             }
             case Op::CallProperty: {
+                uint32_t call_off = static_cast<uint32_t>(
+                    (pc - info->bytecode.data()) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t prop_idx = ReadU8(&pc);
                 uint8_t first_arg = ReadU8(&pc);
@@ -694,6 +713,18 @@ InterpResult Interp::ExecuteTop() {
                         for (auto& ch : out) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                         acc = Value::FromHeap(JSString::New(iso_, out));
                         break;
+                    } else if (method_name == "indexOf") {
+                        JSString* s = static_cast<JSString*>(receiver.AsHeapObject());
+                        if (argc > 0 && args[0].IsString()) {
+                            std::string_view needle = static_cast<JSString*>(args[0].AsHeapObject())->view();
+                            auto pos = s->view().find(needle);
+                            acc = pos == std::string_view::npos
+                                  ? Value::FromSmi(-1)
+                                  : Value::FromSmi(static_cast<intptr_t>(pos));
+                        } else {
+                            acc = Value::FromSmi(-1);
+                        }
+                        break;
                     }
                     callee = iso_->undefined_value();
                 } else {
@@ -704,6 +735,14 @@ InterpResult Interp::ExecuteTop() {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: method is not a function"));
                     pending_exception_ = exc;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = exc;
+                        break;
+                    }
                     return {InterpStatus::kThrew, exc};
                 }
 
@@ -716,6 +755,14 @@ InterpResult Interp::ExecuteTop() {
                 }
                 if (r.status == InterpStatus::kThrew) {
                     pending_exception_ = r.value;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = r.value;
+                        break;
+                    }
                     return r;
                 }
                 sync();
@@ -726,6 +773,8 @@ InterpResult Interp::ExecuteTop() {
             case Op::Call0:
             case Op::Call1:
             case Op::Call2: {
+                uint32_t call_off = static_cast<uint32_t>(
+                    (pc - info->bytecode.data()) - 1);
                 Value callee = acc;
                 Value this_val = iso_->undefined_value();
                 Value argbuf[2];
@@ -757,10 +806,26 @@ InterpResult Interp::ExecuteTop() {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
                     pending_exception_ = exc;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = exc;
+                        break;
+                    }
                     return {InterpStatus::kThrew, exc};
                 }
                 if (r.status == InterpStatus::kThrew) {
                     pending_exception_ = r.value;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = r.value;
+                        break;
+                    }
                     return r;
                 }
                 sync();
@@ -769,6 +834,8 @@ InterpResult Interp::ExecuteTop() {
                 break;
             }
             case Op::Construct: {
+                uint32_t call_off = static_cast<uint32_t>(
+                    (pc - info->bytecode.data()) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
                 (void)ReadU16(&pc);
@@ -785,16 +852,30 @@ InterpResult Interp::ExecuteTop() {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a constructor"));
                     pending_exception_ = exc;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = exc;
+                        break;
+                    }
                     return {InterpStatus::kThrew, exc};
                 }
                 if (r.status == InterpStatus::kThrew) {
                     pending_exception_ = r.value;
+                    uint32_t pc_off = call_off;
+                    uint32_t catch_off = info->FindHandler(pc_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        sync();
+                        pc = info->bytecode.data() + catch_off;
+                        acc = r.value;
+                        break;
+                    }
                     return r;
                 }
                 sync();
                 pc = frame->pc;
-                // If the constructor returned an object, use that; otherwise
-                // use the new object.
                 if (r.value.IsObject()) {
                     acc = r.value;
                 } else {
@@ -895,9 +976,38 @@ InterpResult Interp::ExecuteTop() {
             }
 
             // ----- Iteration -----
+            case Op::ObjectKeys: {
+                (void)ReadU16(&pc);
+                // Create an array of property name strings from acc.
+                JSArray* arr = JSArray::New(iso_, 4);
+                if (acc.IsObject()) {
+                    JSObject* obj = acc.AsObject();
+                    Shape* shape = obj->shape();
+                    for (uint16_t i = 0; i < shape->property_count(); ++i) {
+                        std::string_view name = shape->PropertyNameAt(i);
+                        Value key = Value::FromHeap(JSString::New(iso_, name));
+                        arr->Push(iso_, key);
+                    }
+                } else if (acc.IsArray()) {
+                    // Arrays have numeric indices + "length".
+                    JSArray* a = acc.AsArray();
+                    for (uint32_t i = 0; i < a->length(); ++i) {
+                        Value key = Value::FromHeap(JSString::NewFromSmi(iso_, static_cast<intptr_t>(i)));
+                        arr->Push(iso_, key);
+                    }
+                }
+                acc = Value::FromHeap(arr);
+                break;
+            }
+            case Op::GetIterator: {
+                (void)ReadU16(&pc);
+                // For arrays and strings, the receiver itself is the
+                // "iterator" (for-of uses indexed access with a counter).
+                // No transformation needed.
+                break;
+            }
             case Op::ForInPrepare: {
                 (void)ReadU8(&pc);
-                // Not yet implemented.
                 acc = iso_->undefined_value();
                 break;
             }
@@ -925,14 +1035,26 @@ InterpResult Interp::ExecuteTop() {
             case Op::Throw: {
                 pending_exception_ = acc;
                 frame->pc = pc;
+                // Search for a handler in the current function. Use the
+                // offset of the Throw instruction itself (pc has already
+                // advanced past the opcode byte).
+                uint32_t throw_off = static_cast<uint32_t>(
+                    (pc - info->bytecode.data()) - 1);
+                uint32_t catch_off = info->FindHandler(throw_off);
+                if (catch_off != 0xFFFFFFFF) {
+                    pc = info->bytecode.data() + catch_off;
+                    acc = pending_exception_;
+                    break;
+                }
                 return {InterpStatus::kThrew, acc};
             }
             case Op::TryCatch: {
+                // No-op: the handler table is static (in FunctionInfo).
                 (void)ReadU32(&pc);
-                // Not yet implemented.
                 break;
             }
             case Op::TryFinally: {
+                // Not yet fully implemented.
                 (void)ReadU32(&pc);
                 (void)ReadU32(&pc);
                 break;

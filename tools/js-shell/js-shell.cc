@@ -5,13 +5,8 @@
 // the interpreter. This is the primary entry point for testing the engine.
 //
 // Built-in functions exposed to JS:
-//   print(...args)  -> prints each arg (toString'd) separated by spaces,
-//                       followed by a newline. Returns undefined.
-//   println         -> alias for print.
-//
-// Usage:
-//   js-shell <file.js>
-//   js-shell -e "console.log(1+2)"   (TODO: not yet implemented)
+//   print(...), console.log(...), parseInt, parseFloat, isNaN,
+//   Array.isArray, Object.keys, String.fromCharCode, Math.*
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,30 +22,10 @@
 #include "frontend/lexer/tokens.h"
 #include "frontend/parser/parser.h"
 #include "interpreter/interpreter.h"
+#include "tools/js-shell/builtins.h"
 #include "vm/isolate/isolate.h"
 #include "vm/objects/object.h"
 #include "vm/runtime/runtime.h"
-
-namespace {
-
-// print(...args) -> undefined. Prints each arg's ToString, separated by
-// spaces, followed by a newline.
-v12::Value HostPrint(v12::Interp* interp, v12::Value /*this_val*/,
-                     v12::Value* args, uint32_t argc) {
-    v12::Isolate* iso = interp->isolate();
-    for (uint32_t i = 0; i < argc; ++i) {
-        if (i > 0) std::fputc(' ', stdout);
-        v12::Value s = v12::ToString(iso, args[i]);
-        if (s.IsString()) {
-            std::string_view sv = static_cast<v12::JSString*>(s.AsHeapObject())->view();
-            std::fwrite(sv.data(), 1, sv.size(), stdout);
-        }
-    }
-    std::fputc('\n', stdout);
-    return iso->undefined_value();
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -80,10 +55,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Register the `print` builtin on the global object.
-    v12::HostFunction* print_fn = v12::HostFunction::New(&iso, HostPrint, /*builtin_id=*/0);
-    iso.SetGlobal("print", v12::Value::FromHeap(print_fn));
-    iso.SetGlobal("println", v12::Value::FromHeap(print_fn));
+    // Register all built-in host functions.
+    v12::RegisterBuiltins(&iso);
 
     // Compile the program to bytecode.
     v12::BytecodeGenerator gen(&iso, &arena);
@@ -95,9 +68,9 @@ int main(int argc, char** argv) {
     if (r.status == v12::InterpStatus::kThrew) {
         v12::Value s = v12::ToString(&iso, r.value);
         if (s.IsString()) {
-            std::string_view sv = static_cast<v12::JSString*>(s.AsHeapObject())->view();
+            auto* js = static_cast<v12::JSString*>(s.AsHeapObject());
             std::fprintf(stderr, "Uncaught: %.*s\n",
-                         static_cast<int>(sv.size()), sv.data());
+                         static_cast<int>(js->length()), js->data());
         }
         return 2;
     }

@@ -90,12 +90,20 @@ public:
 
     // Declare a variable in this scope. Returns the Binding.
     // If the variable is already declared here, returns the existing binding.
+    // For block scopes, the variable is allocated a register in the nearest
+    // enclosing function scope (since blocks share the function's register
+    // file).
     Binding* Declare(std::string_view name, bool is_const = false);
 
     // Declare a parameter in this scope. Parameters occupy registers
     // 0..num_params-1 (assigned in order). Must be called before Declare
     // for any local variable.
     Binding* DeclareParameter(std::string_view name);
+
+    // Allocate a register for a block-scoped variable by borrowing from
+    // the nearest enclosing function scope. Called by Declare when the
+    // scope is a block.
+    uint8_t AllocBlockLocal();
 
     // Look up a variable, walking the scope chain. Returns nullptr if not
     // found anywhere (which means it's a global).
@@ -110,9 +118,26 @@ public:
     // slots for captured variables).
     const SmallVector<Binding, 8>& bindings() const { return bindings_; }
 
+    // Returns true if this scope allocates a Context at runtime — i.e., it's
+    // a function scope with at least one captured variable. Used by the
+    // scope resolver to compute context chain depths correctly.
+    bool HasContext() const {
+        if (kind_ != Kind::kFunction) return false;
+        for (const auto& b : bindings_) {
+            if (b.is_captured) return true;
+        }
+        return false;
+    }
+
     // Context slot bookkeeping (filled in by the bytecode generator).
     uint16_t context_slot_count() const { return context_slot_count_; }
     void set_context_slot_count(uint16_t n) { context_slot_count_ = n; }
+
+    // The number of context slots needed by this function scope. Incremented
+    // by MarkCaptured (which is called on captured variables anywhere in this
+    // function's scope tree, including nested block scopes).
+    uint16_t num_context_vars() const { return num_context_vars_; }
+    uint16_t& num_context_vars_mut() { return num_context_vars_; }
 
     // Allocate the next local register index. Register 0..num_params-1 are
     // reserved for parameters; locals start at num_params.
@@ -134,6 +159,7 @@ private:
     Arena* arena_;
     SmallVector<Binding, 8> bindings_;
     uint16_t context_slot_count_ = 0;
+    uint16_t num_context_vars_ = 0;
     uint8_t next_local_ = 0;
     uint8_t num_params_ = 0;
     uint8_t next_param_ = 0;

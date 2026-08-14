@@ -134,13 +134,22 @@ This is an early-stage project. The following components are implemented:
 - ✅ Scope analysis (variable resolution, closure capture detection)
 - ✅ Bytecode generator (AST → register-based bytecode with register allocation)
 - ✅ Register-based interpreter (tier 0) — runs real JS programs
+- ✅ Closures (captured variables via heap-allocated Context chain)
+- ✅ Try/catch exception handling (compile-time handler table)
+- ✅ For-in iteration (object property names)
+- ✅ For-of iteration (arrays, strings)
+- ✅ Built-in functions: print, console.log, parseInt, parseFloat, isNaN,
+  Array.isArray, Object.keys, String.fromCharCode, Math.{abs,floor,ceil,
+  round,sqrt,pow,min,max,random,PI,E}
+- ✅ String methods: charAt, substring/slice, toUpperCase, toLowerCase, indexOf
+- ✅ Array methods: push, pop
 - ✅ Sea-of-Nodes IR (graph, node, types, verifier)
 - ✅ Machine IR contracts (the adapter boundary)
 - ✅ Register allocator interface
 - ✅ Machine emitter interface
 - ✅ Code object with relocations, safepoints, deopt points
 - ✅ IR verifier with use-def consistency checks
-- ✅ Testing framework with 73 passing tests
+- ✅ Testing framework with 91 passing tests
 - ✅ CI configuration (debug, release, ASan+UBSan, Clang)
 
 The interpreter can run programs like:
@@ -148,17 +157,25 @@ The interpreter can run programs like:
 function fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }
 print(fib(10));  // 55
 
-let obj = { name: "Alice", age: 30 };
-obj.city = "NYC";
-print(obj.name, obj.age, obj.city);
+// Closures
+function makeCounter() {
+    let count = 0;
+    return function() { count++; return count; };
+}
+let c = makeCounter();
+print(c(), c(), c());  // 1 2 3
 
-let arr = [1, 2, 3];
-arr.push(4);
-print(arr.length, arr[3]);
+// Try/catch
+try { throw "oops"; } catch (e) { print("caught:", e); }
 
-let sum = 0;
-for (let i = 1; i <= 10; i++) sum += i;
-print(sum);  // 55
+// For-in / for-of
+for (let k in {a:1, b:2}) print(k);
+for (let v of [10, 20, 30]) print(v);
+
+// Math and string methods
+print(Math.sqrt(16), Math.PI);
+print("HELLO".toLowerCase());
+print(Object.keys({x:1, y:2}));
 ```
 
 In progress:
@@ -170,9 +187,11 @@ In progress:
 - 🚧 Code emitter adapters (asmjit)
 - 🚧 Deoptimization
 - 🚧 GC mark-sweep (currently a no-op stub)
-- 🚧 Try/catch/finally (bytecode + interpreter)
-- 🚧 For-in / for-of iteration
+- 🚧 Try/finally (finally block semantics)
 - 🚧 Class semantics (constructors, super, prototypes)
+- 🚧 Switch statements
+- 🚧 Template literals
+- 🚧 Destructuring
 
 ## License
 

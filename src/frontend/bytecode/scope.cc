@@ -32,10 +32,9 @@ Binding* Scope::Declare(std::string_view name, bool is_const) {
     if (kind_ == Kind::kFunction) {
         b.reg = AllocLocal();
     } else if (kind_ == Kind::kBlock) {
-        // Block-local variables share the function's register file.
-        // The bytecode generator assigns register indices later when it
-        // enters the block. We mark them kLocal with reg = 0xFF for now.
-        b.reg = 0xFF;
+        // Block-local variables share the enclosing function's register file.
+        // Walk up to the nearest function scope and allocate from there.
+        b.reg = AllocBlockLocal();
     } else {
         // Global: no register.
         b.reg = 0;
@@ -43,6 +42,20 @@ Binding* Scope::Declare(std::string_view name, bool is_const) {
     b.is_const = is_const;
     bindings_.push_back(b);
     return &bindings_.back();
+}
+
+uint8_t Scope::AllocBlockLocal() {
+    // Walk up to the nearest function or global scope and allocate a
+    // register there. The global scope acts as the "function" scope for
+    // top-level code — its register file is the top-level function's.
+    Scope* s = parent_;
+    while (s != nullptr) {
+        if (s->kind_ == Kind::kFunction || s->kind_ == Kind::kGlobal) {
+            return s->AllocLocal();
+        }
+        s = s->parent_;
+    }
+    return 0;
 }
 
 Binding* Scope::Lookup(std::string_view name) {
@@ -56,10 +69,18 @@ Binding* Scope::Lookup(std::string_view name) {
 void Scope::MarkCaptured(Binding* b) {
     if (b->is_captured) return;
     b->is_captured = true;
-    // The binding's location transitions to kContext. The actual context
-    // slot index is assigned later by the bytecode generator when it
-    // allocates the function's Context.
     b->location = VarLocation::kContext;
+    // Assign a context slot on the nearest function/global scope. This
+    // handles both function-scoped and block-scoped captured variables.
+    // The function scope's num_context_vars_ tracks the total number of
+    // context slots needed (including from nested block scopes).
+    Scope* fn = this;
+    while (fn != nullptr && fn->kind_ != Kind::kFunction && fn->kind_ != Kind::kGlobal) {
+        fn = fn->parent_;
+    }
+    if (fn != nullptr) {
+        b->context_index = fn->num_context_vars_++;
+    }
 }
 
 // ----- ScopeAnalyzer -----
@@ -198,11 +219,19 @@ void ScopeAnalyzer::VisitStmt(Stmt* s, Scope* current) {
             Try* t = static_cast<Try*>(s);
             VisitStmt(t->block, current);
             if (t->catch_clause) {
-                Scope* catch_scope = arena_->New<Scope>(Scope::Kind::kBlock, current, arena_);
+                // The catch body is a Block; VisitStmt will create a new
+                // block scope for it. We need to declare the catch parameter
+                // `e` in that scope. We visit the body first (which creates
+                // the scope and sets it on the body node), then declare `e`
+                // in that scope. This works because declaration happens in
+                // pass 1 and reference resolution happens in pass 2.
+                VisitStmt(t->catch_clause->body, current);
                 if (!t->catch_clause->param.empty()) {
-                    catch_scope->Declare(t->catch_clause->param);
+                    Scope* body_scope = GetScope(t->catch_clause->body);
+                    if (body_scope != nullptr) {
+                        body_scope->Declare(t->catch_clause->param);
+                    }
                 }
-                VisitStmt(t->catch_clause->body, catch_scope);
             }
             if (t->finally_block) VisitStmt(t->finally_block, current);
             break;
@@ -480,9 +509,12 @@ void ScopeAnalyzer::ResolveReferences(Stmt* s, Scope* current) {
             Try* t = static_cast<Try*>(s);
             ResolveReferences(t->block, current);
             if (t->catch_clause) {
-                Scope* catch_scope = GetScope(t);
+                // The catch body's scope was set by VisitStmt (it's the
+                // block scope of the catch body, which includes the catch
+                // parameter `e`).
+                Scope* body_scope = GetScope(t->catch_clause->body);
                 ResolveReferences(t->catch_clause->body,
-                                   catch_scope ? catch_scope : current);
+                                   body_scope ? body_scope : current);
             }
             if (t->finally_block) ResolveReferences(t->finally_block, current);
             break;
@@ -520,34 +552,30 @@ void ScopeAnalyzer::ResolveReferences(Expr* e, Scope* current) {
             Identifier* id = static_cast<Identifier*>(e);
             // Find the enclosing function scope of `current`. Variables in
             // that scope (or in block scopes within it) are local to this
-            // function. Variables in FURTHER-outer function scopes are
-            // captured by this function's closure.
+            // function. Variables in FURTHER-outer scopes are captured by
+            // this function's closure.
             Scope* enclosing_fn = current;
             while (enclosing_fn != nullptr &&
                    enclosing_fn->kind() != Scope::Kind::kFunction) {
                 enclosing_fn = enclosing_fn->parent();
             }
-            // Walk the scope chain looking for the binding.
+            // Walk the scope chain looking for the binding. Track whether
+            // we've passed the enclosing function (meaning we're now in an
+            // outer scope — any binding found here is captured).
+            bool passed_enclosing_fn = false;
             Scope* s = current;
             while (s != nullptr) {
                 for (auto& x : s->bindings()) {
                     if (x.name == id->name) {
-                        // Found it. If `s` is outside the enclosing function
-                        // (i.e., `s` is an ancestor of `enclosing_fn`), and
-                        // `s` is a function scope, then this binding is
-                        // captured by our closure.
-                        if (s != enclosing_fn && s->kind() == Scope::Kind::kFunction &&
-                            x.location == VarLocation::kLocal) {
+                        // If we've passed the enclosing function, this binding
+                        // is in an outer scope and must be captured.
+                        if (passed_enclosing_fn && x.location == VarLocation::kLocal) {
                             s->MarkCaptured(&const_cast<Binding&>(x));
                         }
-                        // Also: if the binding is in the enclosing function
-                        // itself but accessed from a nested function (not yet
-                        // possible since we don't recurse into nested
-                        // functions here), it would be captured. The nested
-                        // function's own ResolveReferences pass handles that.
                         goto found;
                     }
                 }
+                if (s == enclosing_fn) passed_enclosing_fn = true;
                 s = s->parent();
             }
             found:
@@ -654,15 +682,18 @@ ResolvedVar ScopeAnalyzer::Resolve(std::string_view name, Scope* current_scope) 
     ResolvedVar r;
     r.name = name;
     // Walk the scope chain looking for the binding.
+    // The context depth counts only function scopes that have a Context
+    // (i.e., HasContext() is true). Block scopes and functions without
+    // captured variables don't add to the depth.
     Scope* s = current_scope;
     uint16_t depth = 0;
+    // The first function scope we encounter is the current function. If it
+    // has a context, ctx points to it (depth 0). We don't count it.
+    bool passed_first_function = false;
     while (s != nullptr) {
         for (auto& b : s->bindings()) {
             if (b.name == name) {
                 if (b.location == VarLocation::kContext) {
-                    // Walk back to find the function scope that owns this
-                    // context slot. The depth is the number of function
-                    // scopes between current and the owner.
                     r.location = VarLocation::kContext;
                     r.context_depth = depth;
                     r.context_index = b.context_index;
@@ -677,8 +708,29 @@ ResolvedVar ScopeAnalyzer::Resolve(std::string_view name, Scope* current_scope) 
                 }
             }
         }
+        // Moving up to the parent scope. If this scope is a function with a
+        // context, increment the depth (but only after the first function).
+        if (s->kind() == Scope::Kind::kFunction) {
+            if (passed_first_function) {
+                // This is an ancestor function scope. If it has a context,
+                // we'll need to walk past it to reach the next level.
+                // But we increment depth BEFORE checking the parent, so:
+                // actually, depth should increment when we move FROM a
+                // function-with-context TO its parent.
+                // Let me reconsider: depth = number of context links to
+                // traverse from `ctx` to reach the owner's context.
+                // If s has a context and we're moving up, the next scope
+                // up is at depth+1 (if s has a context).
+                if (s->HasContext()) ++depth;
+            } else {
+                passed_first_function = true;
+                // The current function: if it has a context, ctx = this
+                // function's context (depth 0). If not, ctx = the closure
+                // context (which is the nearest ancestor function's context
+                // with a context). Either way, we don't increment depth here.
+            }
+        }
         s = s->parent();
-        ++depth;
     }
     // Not found anywhere — it's a global (declared implicitly).
     r.location = VarLocation::kGlobal;

@@ -67,6 +67,13 @@ public:
     // Number of properties.
     uint16_t property_count() const { return property_count_; }
 
+    // Get the property name at a given slot index. Used by for-in iteration
+    // and Object.keys().
+    std::string_view PropertyNameAt(Slot slot) const {
+        V12_DCHECK(slot < properties_.size(), "property slot out of range");
+        return properties_[slot].name;
+    }
+
     // Total size of the object body in bytes (excluding header).
     // Each property is one Value (8 bytes on 64-bit).
     uint32_t instance_size() const {
