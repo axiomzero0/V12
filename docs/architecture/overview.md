@@ -76,9 +76,28 @@ never the library-specific APIs.
 
 ### Tier 0: Interpreter
 
-The bytecode interpreter executes FunctionInfo bytecode. It records type
-feedback into a FeedbackVector. When a function's hotness counter exceeds
-a threshold, the function is queued for baseline compilation.
+The bytecode interpreter (`src/interpreter/interpreter.{h,cc}`) executes
+FunctionInfo bytecode. It is a **register-based** interpreter: each
+function activation has its own register file (an array of `Value`),
+and most opcodes read from / write to the accumulator (a virtual
+register) plus named register operands.
+
+Key design points:
+- **Dispatch**: switch-based dispatch loop. The accumulator is held in a
+  hot C++ local variable to avoid a memory load per opcode.
+- **Calling convention**: arguments are placed in the callee's register
+  file slots 0..N-1. The callee's parameters occupy those slots.
+- **Recursion**: calling a JSFunction re-enters `ExecuteTop` recursively,
+  keeping the C++ call stack in sync with the JS call stack.
+- **Closure capture**: when a function references a variable from an
+  enclosing function, the variable is allocated in a `Context` object
+  (heap-allocated, linked by parent pointers). The bytecode generator
+  emits `CreateContext` + `PushContext` at function entry, and
+  `LoadContext`/`StoreContext` for accesses.
+
+The interpreter records type feedback into a FeedbackVector (currently
+a no-op). When a function's hotness counter exceeds a threshold, the
+function is queued for baseline compilation (not yet implemented).
 
 ### Tier 1: Baseline JIT
 

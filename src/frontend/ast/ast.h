@@ -251,12 +251,12 @@ struct ArrayLiteral : public Expr {
 };
 
 struct ObjectProperty {
-    Expr* key;          // Identifier or computed expr
-    Expr* value;
-    bool is_computed;
-    bool is_method;     // shorthand method
-    bool is_get;
-    bool is_set;
+    Expr* key = nullptr;          // Identifier or computed expr
+    Expr* value = nullptr;
+    bool is_computed = false;
+    bool is_method = false;       // shorthand method
+    bool is_get = false;
+    bool is_set = false;
     SourceRange range;
 };
 

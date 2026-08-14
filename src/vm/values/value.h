@@ -40,6 +40,7 @@ class JSNumber;
 class JSBoolean;
 class JSUndefined;
 class JSNull;
+class HostFunction;
 
 // A Value is just a TaggedValue with high-level helpers.
 class Value {
@@ -57,7 +58,8 @@ public:
     bool IsString() const;
     bool IsObject() const;
     bool IsArray() const;
-    bool IsFunction() const;
+    bool IsFunction() const;       // JSFunction or HostFunction
+    bool IsHostFunction() const;
     bool IsBoolean() const;
     bool IsUndefined() const;
     bool IsNull() const;
@@ -71,6 +73,7 @@ public:
     JSObject* AsObject() const;
     JSArray* AsArray() const;
     JSFunction* AsFunction() const;
+    HostFunction* AsHostFunction() const;
 
     TaggedValue raw() const { return raw_; }
 

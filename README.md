@@ -126,21 +126,42 @@ This is an early-stage project. The following components are implemented:
 - ✅ Parser (most JS syntax: functions, classes, control flow, expressions)
 - ✅ AST with source positions
 - ✅ Bytecode format and opcode definitions
-- ✅ VM value model (TaggedValue, HeapObject, Shape)
+- ✅ VM value model (TaggedValue, HeapObject, Shape, Context)
+- ✅ Singleton primitives (Undefined, Null, True, False) properly per-Isolate
+- ✅ Object model with backing-store property storage (shape transitions work correctly)
+- ✅ Runtime helpers (ToBoolean, ToNumber, ToString, Add, comparison ops, etc.)
+- ✅ HostFunction support (native C++ functions callable from JS)
+- ✅ Scope analysis (variable resolution, closure capture detection)
+- ✅ Bytecode generator (AST → register-based bytecode with register allocation)
+- ✅ Register-based interpreter (tier 0) — runs real JS programs
 - ✅ Sea-of-Nodes IR (graph, node, types, verifier)
 - ✅ Machine IR contracts (the adapter boundary)
 - ✅ Register allocator interface
 - ✅ Machine emitter interface
 - ✅ Code object with relocations, safepoints, deopt points
 - ✅ IR verifier with use-def consistency checks
-- ✅ Testing framework with 44 passing tests
+- ✅ Testing framework with 73 passing tests
 - ✅ CI configuration (debug, release, ASan+UBSan, Clang)
 
+The interpreter can run programs like:
+```js
+function fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }
+print(fib(10));  // 55
+
+let obj = { name: "Alice", age: 30 };
+obj.city = "NYC";
+print(obj.name, obj.age, obj.city);
+
+let arr = [1, 2, 3];
+arr.push(4);
+print(arr.length, arr[3]);
+
+let sum = 0;
+for (let i = 1; i <= 10; i++) sum += i;
+print(sum);  // 55
+```
+
 In progress:
-- 🚧 Bytecode generator (AST → bytecode)
-- 🚧 Interpreter (bytecode execution)
-- 🚧 Object model implementation
-- 🚧 Shape transitions
 - 🚧 Type feedback system
 - 🚧 Inline caches
 - 🚧 IR builder (bytecode → Sea-of-Nodes)
@@ -148,7 +169,10 @@ In progress:
 - 🚧 Lowering (IR → Machine IR)
 - 🚧 Code emitter adapters (asmjit)
 - 🚧 Deoptimization
-- 🚧 GC mark-sweep
+- 🚧 GC mark-sweep (currently a no-op stub)
+- 🚧 Try/catch/finally (bytecode + interpreter)
+- 🚧 For-in / for-of iteration
+- 🚧 Class semantics (constructors, super, prototypes)
 
 ## License
 

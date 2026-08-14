@@ -4,6 +4,10 @@
 
 #include "frontend/bytecode/bytecode.h"
 
+#include "vm/isolate/isolate.h"
+#include "vm/objects/object.h"
+#include "vm/objects/primitives.h"
+
 namespace v12 {
 
 const char* OpName(Op op) {
@@ -84,7 +88,7 @@ constexpr OpInfo kOpInfos[] = {
     {Op::StoreContext,       "StoreContext",       OperandKind::kReg,      OperandKind::kImm16,OperandKind::kIdx,  6},
 
     {Op::Call,               "Call",               OperandKind::kArgCount, OperandKind::kReg,  OperandKind::kIdx, 6},
-    {Op::CallProperty,       "CallProperty",       OperandKind::kArgCount, OperandKind::kPropertyIdx, OperandKind::kIdx, 6},
+    {Op::CallProperty,       "CallProperty",       OperandKind::kArgCount, OperandKind::kPropertyIdx, OperandKind::kIdx, 8},
     {Op::Call0,              "Call0",              OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
     {Op::Call1,              "Call1",              OperandKind::kReg,      OperandKind::kIdx,  OperandKind::kNone, 4},
     {Op::Call2,              "Call2",              OperandKind::kReg,      OperandKind::kReg,  OperandKind::kIdx, 5},
@@ -95,6 +99,13 @@ constexpr OpInfo kOpInfos[] = {
     {Op::NewArray,           "NewArray",           OperandKind::kImm16,    OperandKind::kNone, OperandKind::kNone, 3},
     {Op::DefineProperty,     "DefineProperty",     OperandKind::kReg,      OperandKind::kPropertyIdx, OperandKind::kNone, 4},
     {Op::CreateClosure,      "CreateClosure",      OperandKind::kConst,    OperandKind::kNone, OperandKind::kNone, 5},
+    {Op::PushArray,          "PushArray",          OperandKind::kReg,      OperandKind::kIdx,  OperandKind::kNone, 4},
+    {Op::LoadArrayLength,    "LoadArrayLength",    OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
+    {Op::StoreArrayLength,   "StoreArrayLength",   OperandKind::kReg,      OperandKind::kIdx,  OperandKind::kNone, 4},
+
+    {Op::CreateContext,      "CreateContext",      OperandKind::kImm16,    OperandKind::kIdx,  OperandKind::kNone, 5},
+    {Op::PushContext,        "PushContext",        OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
+    {Op::PopContext,         "PopContext",         OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
 
     {Op::ForInPrepare,       "ForInPrepare",       OperandKind::kReg,      OperandKind::kNone, OperandKind::kNone, 2},
     {Op::ForInNext,          "ForInNext",          OperandKind::kReg,      OperandKind::kReg,  OperandKind::kNone, 3},
@@ -124,6 +135,36 @@ static_assert(sizeof(kOpInfos) / sizeof(kOpInfos[0]) == static_cast<size_t>(Op::
 const OpInfo& GetOpInfo(Op op) {
     V12_DCHECK(static_cast<size_t>(op) < static_cast<size_t>(Op::kCount), "invalid opcode");
     return kOpInfos[static_cast<size_t>(op)];
+}
+
+// Resolve a Constant entry to a runtime Value, allocating heap objects as
+// needed. Called by the interpreter for LdaConst / AddConst / etc.
+Value FunctionInfo::ResolveConstant(Isolate* iso, uint32_t idx) const {
+    V12_DCHECK(idx < constants.size(), "constant index out of range");
+    const Constant& c = constants[idx];
+    switch (c.kind) {
+        case Constant::Kind::kSmi:
+            return Value::FromSmi(static_cast<intptr_t>(c.smi));
+        case Constant::Kind::kNumber:
+            return Value::FromHeap(JSNumber::New(iso, c.number));
+        case Constant::Kind::kString:
+            V12_DCHECK(c.index < property_names.size(),
+                       "string constant index out of range");
+            return Value::FromHeap(JSString::New(iso, property_names[c.index]));
+        case Constant::Kind::kBoolean:
+            return c.boolean ? iso->true_value() : iso->false_value();
+        case Constant::Kind::kUndefined:
+            return iso->undefined_value();
+        case Constant::Kind::kNull:
+            return iso->null_value();
+        case Constant::Kind::kFunctionInfo:
+            // FunctionInfo constants are resolved by the interpreter (which
+            // needs to wrap them in a JSFunction with the right closure
+            // context). Return undefined here; this path should not be
+            // hit through LdaConst.
+            return iso->undefined_value();
+    }
+    return iso->undefined_value();
 }
 
 }  // namespace v12

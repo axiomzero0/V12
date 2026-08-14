@@ -852,7 +852,7 @@ Expr* Parser::ParseObjectLiteral(const Token& start_tok) {
     Next();  // consume '{'
     auto* obj = arena_->New<ObjectLiteral>(RangeFrom(start_tok));
     while (!Peek().Is(TokenKind::kRBrace) && !Peek().Is(TokenKind::kEof)) {
-        ObjectProperty prop;
+        ObjectProperty prop{};
         prop.range = EmptyRangeAt(Peek());
 
         // get/set

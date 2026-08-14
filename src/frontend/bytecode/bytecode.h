@@ -23,6 +23,7 @@
 #define V12_FRONTEND_BYTECODE_BYTECODE_H_
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,6 +32,9 @@
 #include "base/small-vector.h"
 
 namespace v12 {
+
+class Value;   // forward declaration; full definition in vm/values/value.h
+class Isolate; // forward declaration; full definition in vm/isolate/isolate.h
 
 // Register reference: 0..255 are local registers; higher values are special.
 // We use 8-bit register IDs to keep bytecode compact.
@@ -149,9 +153,17 @@ enum class Op : uint8_t {
 
     // Object / array creation
     NewObject,          // acc = new {}
-    NewArray,           // acc = new []
+    NewArray,           // acc = new [] (initial capacity imm16)
     DefineProperty,     // acc.name = reg (used in object literal)
-    CreateClosure,      // acc = closure of function[idx]
+    CreateClosure,      // acc = closure of function_info[idx]
+    PushArray,          // arr.reg = arr.reg, push acc  (acc is the value)
+    LoadArrayLength,    // acc = (acc as Array).length
+    StoreArrayLength,   // (acc as Array).length = reg
+
+    // Context allocation (for closure capture)
+    CreateContext,      // acc = new Context(slot_count: imm16)  parent = current
+    PushContext,        // current = acc  (set the running frame's context)
+    PopContext,         // current = current.parent  (restore prior context)
 
     // Iteration
     ForInPrepare,
@@ -215,19 +227,21 @@ struct Constant {
     };
 };
 
-// FunctionInfo: per-function metadata. One per JS function.
+// FunctionInfo: per-function metadata. One per JS function (and one for
+// the top-level program). Owned by a BytecodeProgram (see below).
 struct FunctionInfo {
-    std::string_view name;
+    std::string name;       // owning std::string so string_view is stable
     std::vector<uint8_t> bytecode;
     std::vector<Constant> constants;
-    std::vector<std::string_view> property_names;  // for property access ops
-    std::vector<std::string_view> global_names;
+    std::vector<std::string> property_names;  // owning strings for stable views
+    std::vector<std::string> global_names;
     uint16_t num_parameters = 0;
     uint16_t num_registers = 0;     // locals + temporaries
-    uint16_t num_context_vars = 0;
+    uint16_t num_context_vars = 0;  // captured-variable slots in this fn's Context
     bool strict = false;
     bool is_async = false;
     bool is_generator = false;
+    bool is_toplevel = false;       // true for the program-level FunctionInfo
 
     // Feedback vector size (number of slots).
     uint16_t feedback_vector_length = 0;
@@ -240,6 +254,27 @@ struct FunctionInfo {
         uint32_t column;
     };
     std::vector<SourcePosition> source_positions;
+
+    // Look up a constant's Value at runtime. Returns the appropriate Value
+    // (Smi, HeapNumber, JSString, etc.) given an Isolate.
+    Value ResolveConstant(Isolate* iso, uint32_t idx) const;
+};
+
+// BytecodeProgram: the result of compiling a whole source file. Owns:
+//   - All FunctionInfos (the toplevel + nested functions).
+//   - The interner state needed to keep string_views alive.
+// Lifetime: as long as the program is runnable.
+struct BytecodeProgram {
+    std::vector<std::unique_ptr<FunctionInfo>> functions;
+    FunctionInfo* toplevel = nullptr;
+
+    FunctionInfo* NewFunction(std::string name) {
+        auto fi = std::make_unique<FunctionInfo>();
+        fi->name = std::move(name);
+        FunctionInfo* raw = fi.get();
+        functions.push_back(std::move(fi));
+        return raw;
+    }
 };
 
 }  // namespace v12

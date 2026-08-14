@@ -35,6 +35,12 @@ Shape* Shape::Empty(Isolate* iso) {
     return empty;
 }
 
+Shape* Shape::NewWithKind(Isolate* iso, HeapObjectKind kind) {
+    Shape* s = new Shape(iso, iso->NextShapeId(), nullptr, {}, 0);
+    s->set_object_kind(kind);
+    return s;
+}
+
 Shape* Shape::AddProperty(Isolate* iso, std::string_view name) {
     // Check if a transition already exists.
     if (Shape* existing = LookupTransition(name)) {

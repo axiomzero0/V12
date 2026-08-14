@@ -8,7 +8,6 @@
 //   - The root set (singletons like undefined, null, true, false)
 //   - The global object
 //   - The shape tree (root shape, array shape, function shape)
-//   - The compilation thread pool (for the JIT)
 //   - Per-thread state (current Context, current Frame)
 //
 // We do NOT support multiple isolates in one process yet. The Isolate is
@@ -49,6 +48,7 @@ class JSNumber;
 class JSBoolean;
 class JSUndefined;
 class JSNull;
+class HostFunction;
 class FunctionInfo;
 class FeedbackVector;
 class Interner;
@@ -114,14 +114,16 @@ public:
     // ----- Global object -----
     JSObject* global_object() const { return global_object_; }
 
+    // Define a global property with a value.
+    void SetGlobal(std::string_view name, Value v);
+
+    // Lookup a global property. Returns undefined if not present.
+    Value GetGlobal(std::string_view name);
+
     // ----- Arenas -----
     // Persistent arena for things that live as long as the Isolate
     // (e.g. FunctionInfos, Bytecode).
     Arena* permanent_arena() { return &permanent_arena_; }
-
-    // ----- Source position lookup -----
-    // Given a FunctionInfo and a bytecode offset, return the source line.
-    // (Used for stack traces.)
 
     // ----- Statistics -----
     struct Stats {

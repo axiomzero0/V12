@@ -47,6 +47,11 @@ public:
     // Create the empty shape (no properties). Singleton per Isolate.
     static Shape* Empty(Isolate* iso);
 
+    // Create an arbitrary shape with the given HeapObjectKind and no
+    // properties. Used by singleton heap objects (Undefined, Null, etc.)
+    // and by Context to get a shape with a dedicated object_kind().
+    static Shape* NewWithKind(Isolate* iso, HeapObjectKind kind);
+
     // Transition: add a property with the given name. Returns the new Shape.
     // If a transition already exists, returns the cached one.
     Shape* AddProperty(Isolate* iso, std::string_view name);

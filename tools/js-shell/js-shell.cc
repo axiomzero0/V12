@@ -1,8 +1,17 @@
 // =============================================================================
 // tools/js-shell/js-shell.cc
 // =============================================================================
-// Minimal JS shell. Reads a file, parses, runs through the interpreter.
-// This is the primary entry point for testing the engine.
+// Minimal JS shell. Reads a file, parses, compiles to bytecode, runs through
+// the interpreter. This is the primary entry point for testing the engine.
+//
+// Built-in functions exposed to JS:
+//   print(...args)  -> prints each arg (toString'd) separated by spaces,
+//                       followed by a newline. Returns undefined.
+//   println         -> alias for print.
+//
+// Usage:
+//   js-shell <file.js>
+//   js-shell -e "console.log(1+2)"   (TODO: not yet implemented)
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,12 +19,38 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "base/arena.h"
+#include "frontend/bytecode/bytecode-generator.h"
 #include "frontend/lexer/lexer.h"
 #include "frontend/lexer/tokens.h"
 #include "frontend/parser/parser.h"
+#include "interpreter/interpreter.h"
 #include "vm/isolate/isolate.h"
+#include "vm/objects/object.h"
+#include "vm/runtime/runtime.h"
+
+namespace {
+
+// print(...args) -> undefined. Prints each arg's ToString, separated by
+// spaces, followed by a newline.
+v12::Value HostPrint(v12::Interp* interp, v12::Value /*this_val*/,
+                     v12::Value* args, uint32_t argc) {
+    v12::Isolate* iso = interp->isolate();
+    for (uint32_t i = 0; i < argc; ++i) {
+        if (i > 0) std::fputc(' ', stdout);
+        v12::Value s = v12::ToString(iso, args[i]);
+        if (s.IsString()) {
+            std::string_view sv = static_cast<v12::JSString*>(s.AsHeapObject())->view();
+            std::fwrite(sv.data(), 1, sv.size(), stdout);
+        }
+    }
+    std::fputc('\n', stdout);
+    return iso->undefined_value();
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -45,7 +80,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("parsed %zu top-level statements\n", prog->body.size());
-    // TODO: bytecode generation, then interpret.
+    // Register the `print` builtin on the global object.
+    v12::HostFunction* print_fn = v12::HostFunction::New(&iso, HostPrint, /*builtin_id=*/0);
+    iso.SetGlobal("print", v12::Value::FromHeap(print_fn));
+    iso.SetGlobal("println", v12::Value::FromHeap(print_fn));
+
+    // Compile the program to bytecode.
+    v12::BytecodeGenerator gen(&iso, &arena);
+    auto program = gen.Compile(prog);
+
+    // Run it.
+    v12::Interp interp(&iso);
+    v12::InterpResult r = interp.Run(program.get());
+    if (r.status == v12::InterpStatus::kThrew) {
+        v12::Value s = v12::ToString(&iso, r.value);
+        if (s.IsString()) {
+            std::string_view sv = static_cast<v12::JSString*>(s.AsHeapObject())->view();
+            std::fprintf(stderr, "Uncaught: %.*s\n",
+                         static_cast<int>(sv.size()), sv.data());
+        }
+        return 2;
+    }
     return 0;
 }

@@ -4,6 +4,8 @@
 
 #include "vm/objects/object.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "vm/isolate/isolate.h"
@@ -11,65 +13,77 @@
 
 namespace v12 {
 
+// ----- JSObject -----
 JSObject* JSObject::New(Isolate* iso, Shape* initial_shape) {
     if (initial_shape == nullptr) initial_shape = iso->empty_shape();
-    uint32_t size = sizeof(JSObject) + initial_shape->instance_size();
-    void* mem = iso->Allocate(size);
+    void* mem = iso->Allocate(sizeof(JSObject));
     auto* obj = static_cast<JSObject*>(mem);
     obj->set_shape(initial_shape);
-    // Initialize slots to undefined.
-    Value undef = iso->undefined_value();
-    Value* slots = obj->slots();
-    for (uint16_t i = 0; i < initial_shape->property_count(); ++i) {
-        slots[i] = undef;
+
+    uint16_t slot_count = initial_shape->property_count();
+    obj->capacity_ = slot_count;
+    if (slot_count > 0) {
+        obj->properties_ = static_cast<Value*>(
+            iso->Allocate(static_cast<uint32_t>(sizeof(Value) * slot_count)));
+        Value undef = iso->undefined_value();
+        for (uint16_t i = 0; i < slot_count; ++i) {
+            obj->properties_[i] = undef;
+        }
+    } else {
+        obj->properties_ = nullptr;
     }
     return obj;
 }
 
+void JSObject::GrowProperties(Isolate* iso, uint16_t min_slots) {
+    uint16_t new_cap = capacity_ == 0 ? 4 : capacity_;
+    while (new_cap < min_slots) {
+        new_cap = new_cap * 2;
+    }
+    if (new_cap == capacity_) return;
+
+    Value* new_props = static_cast<Value*>(
+        iso->Allocate(static_cast<uint32_t>(sizeof(Value) * new_cap)));
+    Value undef = iso->undefined_value();
+    // Copy existing slots.
+    for (uint16_t i = 0; i < capacity_; ++i) {
+        new_props[i] = properties_[i];
+    }
+    // Initialize new slots to undefined.
+    for (uint16_t i = capacity_; i < new_cap; ++i) {
+        new_props[i] = undef;
+    }
+    properties_ = new_props;
+    capacity_ = new_cap;
+}
+
 Value JSObject::GetProperty(Isolate* iso, std::string_view name) {
+    (void)iso;
     Shape::Slot slot = shape()->Lookup(name);
     if (slot == Shape::kInvalidSlot) {
         return iso->undefined_value();
     }
-    return slots()[slot];
+    return properties_[slot];
 }
 
 void JSObject::SetProperty(Isolate* iso, std::string_view name, Value value) {
-    Shape::Slot slot = shape()->Lookup(name);
+    Shape* cur_shape = shape();
+    Shape::Slot slot = cur_shape->Lookup(name);
     if (slot == Shape::kInvalidSlot) {
-        // Need to transition to a new shape.
-        Shape* new_shape = shape()->AddProperty(iso, name);
-        // Reallocate the object to fit the new property.
-        // In a real engine we'd either:
-        //   - Allocate a new object and copy (slow but simple)
-        //   - Use out-of-line property storage for objects that grow
-        // For simplicity we just allocate a new one.
-        uint32_t new_size = sizeof(JSObject) + new_shape->instance_size();
-        void* mem = iso->Allocate(new_size);
-        auto* new_obj = static_cast<JSObject*>(mem);
-        new_obj->set_shape(new_shape);
-        Value* new_slots = new_obj->slots();
-        Value* old_slots = slots();
-        for (uint16_t i = 0; i < shape()->property_count(); ++i) {
-            new_slots[i] = old_slots[i];
+        // Need to transition to a new shape with the additional property.
+        Shape* new_shape = cur_shape->AddProperty(iso, name);
+        // Switch the object's shape first. The new shape has property_count
+        // equal to (old_count + 1).
+        set_shape(new_shape);
+        uint16_t needed = new_shape->property_count();
+        if (needed > capacity_) {
+            GrowProperties(iso, needed);
         }
-        for (uint16_t i = shape()->property_count(); i < new_shape->property_count(); ++i) {
-            new_slots[i] = iso->undefined_value();
-        }
-        // Copy the rest of the header.
-        // This is a hack - we should just use placement new or have a
-        // per-object allocation strategy. For now we copy the shape pointer
-        // and any other header bits.
-        // (The set_shape above already set the new shape.)
-        // The caller would need to be updated to use the new object pointer.
-        // THIS IS A KNOWN LIMITATION. For correctness testing of the
-        // interpreter, we'll only ever call SetProperty on a fresh object
-        // whose shape we know.
-        new_slots[new_shape->property_count() - 1] = value;
-        // TODO: properly handle the receiver update.
+        // The new property lives at the slot index `needed - 1`.
+        properties_[needed - 1] = value;
         return;
     }
-    slots()[slot] = value;
+    properties_[slot] = value;
 }
 
 bool JSObject::HasProperty(std::string_view name) const {
@@ -78,8 +92,7 @@ bool JSObject::HasProperty(std::string_view name) const {
 
 // ----- JSArray -----
 JSArray* JSArray::New(Isolate* iso, uint32_t initial_capacity) {
-    uint32_t size = sizeof(JSArray);
-    void* mem = iso->Allocate(size);
+    void* mem = iso->Allocate(sizeof(JSArray));
     auto* arr = static_cast<JSArray*>(mem);
     arr->set_shape(iso->array_shape());
     arr->length_ = 0;
@@ -130,7 +143,7 @@ JSString* JSString::New(Isolate* iso, std::string_view str) {
     uint32_t size = sizeof(JSString) + static_cast<uint32_t>(str.size()) + 1;
     void* mem = iso->Allocate(size);
     auto* s = static_cast<JSString*>(mem);
-    s->set_shape(iso->empty_shape());   // TODO: dedicated string shape
+    s->set_shape(Shape::NewWithKind(iso, HeapObjectKind::kString));
     s->length_ = static_cast<uint32_t>(str.size());
     std::memcpy(s + 1, str.data(), str.size());
     reinterpret_cast<char*>(s + 1)[str.size()] = '\0';
@@ -140,13 +153,28 @@ JSString* JSString::New(Isolate* iso, std::string_view str) {
 JSString* JSString::NewFromSmi(Isolate* iso, intptr_t smi) {
     char buf[32];
     int n = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(smi));
-    return New(iso, std::string_view(buf, n));
+    return New(iso, std::string_view(buf, static_cast<size_t>(n)));
+}
+
+JSString* JSString::NewFromDouble(Isolate* iso, double value) {
+    char buf[64];
+    int n;
+    if (std::isnan(value)) {
+        n = std::snprintf(buf, sizeof(buf), "NaN");
+    } else if (std::isinf(value)) {
+        n = std::snprintf(buf, sizeof(buf), value > 0 ? "Infinity" : "-Infinity");
+    } else if (value == std::floor(value) && std::abs(value) < 1e21) {
+        // Integer-valued double: print without decimal point (matches V8).
+        n = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
+    } else {
+        n = std::snprintf(buf, sizeof(buf), "%.17g", value);
+    }
+    return New(iso, std::string_view(buf, static_cast<size_t>(n)));
 }
 
 // ----- JSFunction -----
 JSFunction* JSFunction::New(Isolate* iso, FunctionInfo* info, Context* context) {
-    uint32_t size = sizeof(JSFunction);
-    void* mem = iso->Allocate(size);
+    void* mem = iso->Allocate(sizeof(JSFunction));
     auto* fn = static_cast<JSFunction*>(mem);
     fn->set_shape(iso->function_shape());
     fn->shared_info_ = info;
@@ -154,44 +182,23 @@ JSFunction* JSFunction::New(Isolate* iso, FunctionInfo* info, Context* context) 
     return fn;
 }
 
+// ----- HostFunction -----
+HostFunction* HostFunction::New(Isolate* iso, HostFn fn, int32_t builtin_id) {
+    void* mem = iso->Allocate(sizeof(HostFunction));
+    auto* h = static_cast<HostFunction*>(mem);
+    h->set_shape(Shape::NewWithKind(iso, HeapObjectKind::kExternal));
+    h->fn_ = fn;
+    h->builtin_id_ = builtin_id;
+    return h;
+}
+
 // ----- JSNumber -----
 JSNumber* JSNumber::New(Isolate* iso, double value) {
     void* mem = iso->Allocate(sizeof(JSNumber));
     auto* n = static_cast<JSNumber*>(mem);
-    n->set_shape(iso->empty_shape());   // TODO
+    n->set_shape(Shape::NewWithKind(iso, HeapObjectKind::kNumber));
     n->value_ = value;
     return n;
-}
-
-JSBoolean* JSBoolean::True(Isolate* iso) {
-    static JSBoolean* t = nullptr;
-    if (t == nullptr) {
-        void* mem = iso->Allocate(sizeof(JSBoolean));
-        t = static_cast<JSBoolean*>(mem);
-        t->set_shape(iso->empty_shape());
-        t->value_ = true;
-    }
-    return t;
-}
-
-JSBoolean* JSBoolean::False(Isolate* iso) {
-    static JSBoolean* f = nullptr;
-    if (f == nullptr) {
-        void* mem = iso->Allocate(sizeof(JSBoolean));
-        f = static_cast<JSBoolean*>(mem);
-        f->set_shape(iso->empty_shape());
-        f->value_ = false;
-    }
-    return f;
-}
-
-JSUndefined* GetUndefined(Isolate* iso) {
-    // TODO: allocate singleton
-    return nullptr;
-}
-
-JSNull* GetNull(Isolate* iso) {
-    return nullptr;
 }
 
 }  // namespace v12

@@ -77,7 +77,12 @@ bool Value::IsArray() const {
     return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kArray;
 }
 bool Value::IsFunction() const {
-    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kFunction;
+    if (!IsHeapObject()) return false;
+    HeapObjectKind k = AsHeapObject()->kind();
+    return k == HeapObjectKind::kFunction || k == HeapObjectKind::kExternal;
+}
+bool Value::IsHostFunction() const {
+    return IsHeapObject() && AsHeapObject()->kind() == HeapObjectKind::kExternal;
 }
 bool Value::IsBoolean() const {
     if (IsHeapObject()) {
@@ -113,6 +118,10 @@ JSArray* Value::AsArray() const {
 JSFunction* Value::AsFunction() const {
     V12_DCHECK(IsFunction(), "AsFunction on non-function");
     return static_cast<JSFunction*>(AsHeapObject());
+}
+HostFunction* Value::AsHostFunction() const {
+    V12_DCHECK(IsHostFunction(), "AsHostFunction on non-host-function");
+    return static_cast<HostFunction*>(AsHeapObject());
 }
 
 }  // namespace v12

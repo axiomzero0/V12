@@ -10,6 +10,7 @@
 
 #include "gc/heap.h"
 #include "vm/objects/object.h"
+#include "vm/objects/primitives.h"
 #include "vm/shapes/shape.h"
 
 namespace v12 {
@@ -19,6 +20,8 @@ namespace {
 Isolate* g_current_isolate = nullptr;
 
 // Simple string interner backed by an unordered_map<string, string_view>.
+// The string data is owned by the interner (heap-allocated) so that
+// string_views remain stable across map rehashes.
 class InternerImpl : public Interner {
 public:
     std::string_view Intern(std::string_view s) {
@@ -62,10 +65,17 @@ Isolate* Isolate::Current() {
 }
 
 void Isolate::InitializeRoots() {
-    // Singletons for undefined/null/true/false.
-    // For now these are heap-allocated; in a real engine they'd be special
-    // read-only objects.
-    // We'll defer to JSUndefined/JSNull/JSBoolean which need Shape setup.
+    // Allocate the four singleton primitive objects. Each one gets its own
+    // Shape (with the appropriate object_kind) so that Value::Is* checks
+    // reduce to a shape-kind comparison.
+    undefined_obj_ = JSUndefined::New(this);
+    null_obj_ = JSNull::New(this);
+    true_obj_ = JSBoolean::New(this, true);
+    false_obj_ = JSBoolean::New(this, false);
+    undefined_ = Value::FromHeap(undefined_obj_);
+    null_ = Value::FromHeap(null_obj_);
+    true_ = Value::FromHeap(true_obj_);
+    false_ = Value::FromHeap(false_obj_);
 }
 
 void Isolate::InitializeShapes() {
@@ -75,8 +85,7 @@ void Isolate::InitializeShapes() {
 }
 
 void Isolate::InitializeGlobals() {
-    // global_object_ = JSObject::New(this, empty_shape_);
-    // TODO: once JSObject::New is implemented.
+    global_object_ = JSObject::New(this, empty_shape_);
 }
 
 std::string_view Isolate::Intern(std::string_view s) {
@@ -92,6 +101,14 @@ void* Isolate::Allocate(uint32_t size) {
     stats_.bytes_allocated += size;
     stats_.allocations += 1;
     return p;
+}
+
+void Isolate::SetGlobal(std::string_view name, Value v) {
+    global_object_->SetProperty(this, name, v);
+}
+
+Value Isolate::GetGlobal(std::string_view name) {
+    return global_object_->GetProperty(this, name);
 }
 
 // Interner base class destructor.
