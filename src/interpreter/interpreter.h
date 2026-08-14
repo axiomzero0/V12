@@ -116,22 +116,23 @@ private:
     // the FunctionInfo referenced by a constant pool entry.
     BytecodeProgram* current_program_ = nullptr;
 
-    // The register storage backing all frame register files. Pre-allocated
-    // to max_depth_ * avg_regs_per_frame to avoid realloc during calls.
-    std::vector<Value> reg_storage_;
-    size_t reg_stack_top_ = 0;  // current allocation watermark
+    // The register storage backing all frame register files. We use a
+    // large mmap'd region (lazily committed by the OS) so that the
+    // pointer never moves — no realloc, no stale pointers, no limit.
+    // 256 MB of virtual address space = 32M Value slots = ~2M frames.
+    Value* reg_base_ = nullptr;
+    size_t reg_stack_top_ = 0;
+    static constexpr size_t kRegRegionSize = 256 * 1024 * 1024;  // 256 MB
 
-    // The frame stack. Fixed-capacity array (no vector realloc) so that
-    // frame pointers remain stable across calls. This eliminates the
-    // need for sync() after every Call.
-    static constexpr size_t kMaxFrames = 1024;
-    Frame frames_arr_[kMaxFrames];
-    size_t frame_count_ = 0;
+    // The frame stack. Grows dynamically via std::vector. After each Call,
+    // we re-fetch the frame pointer from frames_.back() — this is a single
+    // load and is always correct regardless of realloc.
+    std::vector<Frame> frames_;
 
     // Pending exception (set by Throw, cleared by TryCatch).
     Value pending_exception_;
 
-    uint32_t max_depth_ = 1000;
+    uint32_t max_depth_ = 100000;
 
     // Execute the top frame on the frame stack until it returns or throws.
     // Marked [[gnu::hot]] and [[gnu::flatten]] so the compiler prioritizes
@@ -148,8 +149,8 @@ private:
     // Pop the top frame.
     void PopFrame();
 
-    // Access the top frame (inline, no vector dereference).
-    Frame* TopFrame() { return &frames_arr_[frame_count_ - 1]; }
+    // Access the top frame.
+    Frame* TopFrame() { return &frames_.back(); }
 
     // Read an operand at the current PC, advancing PC.
     // These use memcpy for multi-byte reads, which the compiler optimizes

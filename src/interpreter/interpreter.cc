@@ -28,6 +28,10 @@
 #include <cstring>
 #include <new>
 
+#if defined(V12_OS_LINUX) || defined(V12_OS_MACOS)
+#include <sys/mman.h>
+#endif
+
 #include "base/macros.h"
 #include "frontend/bytecode/bytecode.h"
 #include "frontend/bytecode/bytecode-generator.h"
@@ -43,58 +47,77 @@ namespace v12 {
 // Construction / destruction
 // -----------------------------------------------------------------------------
 Interp::Interp(Isolate* iso) : iso_(iso) {
-    // Pre-allocate the register storage. We use a watermark allocator:
-    // reg_stack_top_ advances on PushFrame and retreats on PopFrame.
-    // No realloc ever happens during execution.
-    reg_storage_.resize(16384);
+    // Allocate a large virtual region for register storage using mmap.
+    // The OS lazily commits pages (only touched pages use physical RAM),
+    // so 256 MB of virtual space costs almost nothing until actually used.
+    // This eliminates all realloc/stale-pointer issues — the base pointer
+    // never moves.
+#if defined(V12_OS_LINUX) || defined(V12_OS_MACOS)
+    void* mem = mmap(nullptr, kRegRegionSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    V12_CHECK(mem != MAP_FAILED, "failed to mmap register storage region");
+    reg_base_ = static_cast<Value*>(mem);
+#else
+    // Fallback: allocate with malloc (may fail for large sizes).
+    reg_base_ = static_cast<Value*>(std::malloc(kRegRegionSize));
+    V12_CHECK(reg_base_ != nullptr, "failed to allocate register storage");
+#endif
     reg_stack_top_ = 0;
-    frame_count_ = 0;
+    frames_.reserve(1024);
 }
 
-Interp::~Interp() = default;
+Interp::~Interp() {
+#if defined(V12_OS_LINUX) || defined(V12_OS_MACOS)
+    if (reg_base_) munmap(reg_base_, kRegRegionSize);
+#else
+    std::free(reg_base_);
+#endif
+}
 
 // -----------------------------------------------------------------------------
 // Frame management
 // -----------------------------------------------------------------------------
 Value* Interp::PushFrame(FunctionInfo* info, JSFunction* fn, Value this_val,
                           Context* closure_ctx, uint32_t argc, const Value* args) {
-    V12_CHECK(frame_count_ < kMaxFrames, "maximum call stack depth exceeded");
+    V12_CHECK(frames_.size() < max_depth_, "maximum call stack depth exceeded (%u)",
+              max_depth_);
 
     uint16_t nregs = info->num_registers;
     if (nregs == 0) nregs = 1;
     size_t base = reg_stack_top_;
     reg_stack_top_ += nregs;
-    // Grow if needed (shouldn't happen with pre-allocation, but safety).
-    if (reg_stack_top_ > reg_storage_.size()) {
-        reg_storage_.resize(reg_stack_top_ * 2);
-    }
+    // No growth check needed — reg_base_ is a 256 MB mmap'd region.
+    // The OS lazily commits pages as they're touched.
 
-    Frame* f = &frames_arr_[frame_count_++];
-    f->info = info;
-    f->regs = reg_storage_.data() + base;
-    f->pc = info->bytecode.data();
-    f->context = closure_ctx;
-    f->this_val = this_val;
-    f->function = fn;
+    Frame f;
+    f.info = info;
+    f.regs = reg_base_ + base;
+    f.pc = info->bytecode.data();
+    f.context = closure_ctx;
+    f.this_val = this_val;
+    f.function = fn;
+    frames_.push_back(f);
 
+    // Place arguments.
     uint16_t nparams = info->num_parameters;
     uint16_t to_copy = (argc < nparams) ? static_cast<uint16_t>(argc) : nparams;
+    Value* regs = f.regs;
     for (uint16_t i = 0; i < to_copy; ++i) {
-        f->regs[i] = args[i];
+        regs[i] = args[i];
     }
     Value undef = iso_->undefined_value();
     for (uint16_t i = to_copy; i < nparams; ++i) {
-        f->regs[i] = undef;
+        regs[i] = undef;
     }
-    return f->regs;
+    return regs;
 }
 
 void Interp::PopFrame() {
-    --frame_count_;
-    Frame* f = &frames_arr_[frame_count_];
-    uint16_t nregs = f->info->num_registers;
+    Frame& f = frames_.back();
+    uint16_t nregs = f.info->num_registers;
     if (nregs == 0) nregs = 1;
     reg_stack_top_ -= nregs;
+    frames_.pop_back();
 }
 
 // -----------------------------------------------------------------------------
@@ -158,7 +181,7 @@ uint64_t g_opcode_dispatch_counts[256] = {};
 #endif
 
 InterpResult Interp::ExecuteTop() {
-    Frame* frame = &frames_arr_[frame_count_ - 1];
+    Frame* frame = &frames_.back();
     const uint8_t* pc = frame->pc;
     Value acc = iso_->undefined_value();
     FunctionInfo* info = frame->info;
@@ -900,7 +923,7 @@ InterpResult Interp::ExecuteTop() {
                         pending_exception_ = exc;
                         uint32_t catch_off = info->FindHandler(call_off);
                         if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                            frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                             pc = bytecode_base + catch_off;
                             acc = exc;
                             V12_DISPATCH();
@@ -913,7 +936,7 @@ InterpResult Interp::ExecuteTop() {
                     Value* new_regs = PushFrame(callee_info, fn, this_val,
                                                 fn->closure_context(), argc, args);
                     // Update locals to the new frame.
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = new_regs;
                     ctx = frame->context;
                     info = callee_info;
@@ -928,7 +951,7 @@ InterpResult Interp::ExecuteTop() {
                     pending_exception_ = exc;
                     uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                        frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                         pc = bytecode_base + catch_off;
                         acc = exc;
                         V12_DISPATCH();
@@ -1033,7 +1056,7 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t pc_off = call_off;
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                        frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                         pc = bytecode_base + catch_off;
                         acc = exc;
                         V12_DISPATCH();
@@ -1053,14 +1076,14 @@ InterpResult Interp::ExecuteTop() {
                     uint32_t pc_off = call_off;
                     uint32_t catch_off = info->FindHandler(pc_off);
                     if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                        frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                         pc = bytecode_base + catch_off;
                         acc = r.value;
                         V12_DISPATCH();
                     }
                     return r;
                 }
-                frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                 pc = frame->pc;
                 acc = r.value;
                 V12_DISPATCH();
@@ -1106,7 +1129,7 @@ InterpResult Interp::ExecuteTop() {
                         pending_exception_ = exc;
                         uint32_t catch_off = info->FindHandler(call_off);
                         if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                            frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                             pc = bytecode_base + catch_off;
                             acc = exc;
                             V12_DISPATCH();
@@ -1116,7 +1139,7 @@ InterpResult Interp::ExecuteTop() {
                     frame->pc = pc;
                     Value* new_regs = PushFrame(callee_info, fn, this_val,
                                                 fn->closure_context(), argc, argbuf);
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = new_regs;
                     ctx = frame->context;
                     info = callee_info;
@@ -1131,7 +1154,7 @@ InterpResult Interp::ExecuteTop() {
                     pending_exception_ = exc;
                     uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                        frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                         pc = bytecode_base + catch_off;
                         acc = exc;
                         V12_DISPATCH();
@@ -1165,7 +1188,7 @@ InterpResult Interp::ExecuteTop() {
                         pending_exception_ = exc;
                         uint32_t catch_off = info->FindHandler(call_off);
                         if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                            frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                             pc = bytecode_base + catch_off;
                             acc = exc;
                             V12_DISPATCH();
@@ -1175,7 +1198,7 @@ InterpResult Interp::ExecuteTop() {
                     frame->pc = pc;
                     Value* new_regs = PushFrame(callee_info, fn, new_obj,
                                                 fn->closure_context(), argc, args);
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = new_regs;
                     ctx = frame->context;
                     info = callee_info;
@@ -1196,7 +1219,7 @@ InterpResult Interp::ExecuteTop() {
                     pending_exception_ = exc;
                     uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_arr_[frame_count_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
+                        frame = &frames_.back(); regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                         pc = bytecode_base + catch_off;
                         acc = exc;
                         V12_DISPATCH();
@@ -1349,12 +1372,12 @@ InterpResult Interp::ExecuteTop() {
             // the caller (inline return — no C++ recursion). If this is
             // the toplevel frame, return from ExecuteTop.
             L_Return: {
-                if (frame_count_ > 1) {
+                if (frames_.size() > 1) {
                     // Save the return value (acc) before popping.
                     Value retval = acc;
                     PopFrame();
                     // Restore caller's state.
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = frame->regs;
                     ctx = frame->context;
                     info = frame->info;
@@ -1367,9 +1390,9 @@ InterpResult Interp::ExecuteTop() {
                 return {InterpStatus::kReturned, acc};
             }
             L_ReturnUndefined: {
-                if (frame_count_ > 1) {
+                if (frames_.size() > 1) {
                     PopFrame();
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = frame->regs;
                     ctx = frame->context;
                     info = frame->info;
@@ -1401,13 +1424,13 @@ InterpResult Interp::ExecuteTop() {
                     }
                     // No handler in this function — pop the frame and
                     // search the caller's handler table.
-                    if (frame_count_ <= 1) {
+                    if (frames_.size() <= 1) {
                         // Toplevel — uncaught exception.
                         frame->pc = pc;
                         return {InterpStatus::kThrew, acc};
                     }
                     PopFrame();
-                    frame = &frames_arr_[frame_count_ - 1];
+                    frame = &frames_.back();
                     regs = frame->regs;
                     ctx = frame->context;
                     info = frame->info;
