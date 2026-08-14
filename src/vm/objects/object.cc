@@ -164,12 +164,49 @@ JSString* JSString::NewFromDouble(Isolate* iso, double value) {
     } else if (std::isinf(value)) {
         n = std::snprintf(buf, sizeof(buf), value > 0 ? "Infinity" : "-Infinity");
     } else if (value == std::floor(value) && std::abs(value) < 1e21) {
-        // Integer-valued double: print without decimal point (matches V8).
         n = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
     } else {
         n = std::snprintf(buf, sizeof(buf), "%.17g", value);
     }
     return New(iso, std::string_view(buf, static_cast<size_t>(n)));
+}
+
+// ----- ConsString -----
+ConsString* ConsString::New(Isolate* iso, JSString* left, JSString* right) {
+    void* mem = iso->Allocate(sizeof(ConsString));
+    auto* cs = static_cast<ConsString*>(mem);
+    cs->set_shape(Shape::NewWithKind(iso, HeapObjectKind::kConsString));
+    cs->length_ = left->length() + right->length();
+    cs->left_ = left;
+    cs->right_ = right;
+    cs->flattened_ = false;
+    cs->flat_ = nullptr;
+    return cs;
+}
+
+JSString* ConsString::Flatten(Isolate* iso) {
+    if (flattened_) return flat_;
+    std::string out;
+    out.reserve(length_);
+    // Walk the cons tree. left_ and right_ are stored as JSString* but
+    // may actually be ConsString* (both inherit HeapObject). We check
+    // kind() to dispatch.
+    auto walk = [&](HeapObject* h, auto& self) -> void {
+        if (h == nullptr) return;
+        if (h->kind() == HeapObjectKind::kConsString) {
+            ConsString* cs = static_cast<ConsString*>(h);
+            self(cs->left_, self);
+            self(cs->right_, self);
+        } else {
+            JSString* s = static_cast<JSString*>(h);
+            out += std::string(s->data(), s->length());
+        }
+    };
+    walk(left_, walk);
+    walk(right_, walk);
+    flat_ = JSString::New(iso, out);
+    flattened_ = true;
+    return flat_;
 }
 
 // ----- JSFunction -----

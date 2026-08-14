@@ -7,6 +7,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(V12_OS_LINUX) || defined(V12_OS_MACOS)
+#include <sys/mman.h>
+#endif
+
 #include "vm/values/value.h"
 
 namespace v12 {
@@ -20,7 +24,20 @@ Heap::~Heap() = default;
 void Heap::AllocateNewChunk(size_t min_size) {
     size_t sz = min_size > kChunkSize ? min_size : kChunkSize;
     auto chunk = std::make_unique<HeapChunk>();
-    chunk->base = static_cast<uint8_t*>(std::malloc(sz));
+    // Use mmap with MAP_POPULATE to pre-fault pages. This avoids page-fault
+    // storms during warmup (the OS hands back lazy pages from malloc; first
+    // touch triggers a fault per 4 KB).
+#if defined(V12_OS_LINUX) || defined(V12_OS_MACOS)
+    void* mem = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        // Fall back to malloc if mmap fails.
+        mem = std::malloc(sz);
+    }
+#else
+    void* mem = std::malloc(sz);
+#endif
+    chunk->base = static_cast<uint8_t*>(mem);
     V12_CHECK(chunk->base != nullptr, "heap OOM: requested %zu bytes", sz);
     chunk->top = chunk->base;
     chunk->limit = chunk->base + sz;
@@ -29,8 +46,9 @@ void Heap::AllocateNewChunk(size_t min_size) {
 }
 
 void* Heap::Allocate(uint32_t size) {
-    // Align to 8 bytes.
-    size = (size + 7) & ~7u;
+    // Align to 16 bytes for better cache-line behavior (reduces false
+    // sharing and lets the CPU do aligned loads).
+    size = (size + 15) & ~15u;
 
     if (current_chunk_->top + size > current_chunk_->limit) {
         if (total_bytes_allocated_ > gc_threshold_) {

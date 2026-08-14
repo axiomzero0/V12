@@ -119,6 +119,9 @@ enum class Op : uint8_t {
     // Increment / decrement
     Inc,
     Dec,
+    IncReg,             // R[imm8] = R[imm8] + 1  (fused Ldar+Inc+Star)
+    DecReg,             // R[imm8] = R[imm8] - 1
+    AddConstToReg,      // R[r1:imm8] += K[r2:imm8]  (fused for += const)
 
     // Control flow
     Jump,               // unconditional

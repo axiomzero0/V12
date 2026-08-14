@@ -77,6 +77,14 @@ private:
     // only at function exit).
     uint8_t AllocTemp(FnState* fs);
 
+    // Run a peephole optimization pass over the bytecode. Removes:
+    //   - Ldar r; Star r → nop (acc already equals r after Ldar)
+    //   - Star r; Ldar r → nop (acc already equals r after Star)
+    //   - Jump X; X: → drop the Jump
+    //   - LdaUndefined; Return → ReturnUndefined
+    // Returns the number of instructions removed.
+    size_t PeepholeOptimize(FunctionInfo* fi);
+
     // Compile a function body. Returns the FunctionInfo.
     FunctionInfo* CompileFunction(FnState* parent_fs,
                                    Scope* fn_scope,

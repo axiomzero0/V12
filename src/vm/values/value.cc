@@ -20,6 +20,7 @@ const char* HeapObjectKindName(HeapObjectKind kind) {
         case HeapObjectKind::kObject:        return "Object";
         case HeapObjectKind::kArray:         return "Array";
         case HeapObjectKind::kString:        return "String";
+        case HeapObjectKind::kConsString:    return "ConsString";
         case HeapObjectKind::kFunction:      return "Function";
         case HeapObjectKind::kBoundFunction: return "BoundFunction";
         case HeapObjectKind::kNumber:        return "Number";

@@ -154,6 +154,40 @@ private:
     // char data follows immediately after.
 };
 
+// ConsString - a rope of two strings. Used for efficient repeated
+// concatenation: s = s + "x" builds a left-leaning tree instead of
+// copying the entire string each time. The string is materialized
+// (flattened into a flat JSString) lazily on first indexed access.
+//
+// Layout:
+//   [ HeapObject header ]
+//   [ uint32_t length_  ]   (total length of the concatenated string)
+//   [ JSString* left_    ]
+//   [ JSString* right_   ]
+//   [ bool flattened_    ]
+//   [ JSString* flat_    ]   (the materialized flat string, or nullptr)
+class ConsString : public HeapObject {
+public:
+    static ConsString* New(Isolate* iso, JSString* left, JSString* right);
+
+    uint32_t length() const { return length_; }
+    HeapObject* left() const { return left_; }
+    HeapObject* right() const { return right_; }
+    bool flattened() const { return flattened_; }
+    JSString* flat() const { return flat_; }
+
+    // Flatten the cons string into a flat JSString. Called on first
+    // indexed access (charAt, substring, etc.). Returns the flat string.
+    JSString* Flatten(Isolate* iso);
+
+private:
+    uint32_t length_;
+    HeapObject* left_;   // JSString* or ConsString*
+    HeapObject* right_;  // JSString* or ConsString*
+    bool flattened_;
+    JSString* flat_;
+};
+
 // JSFunction - closure. Captures the FunctionInfo and the defining Context.
 // Layout:
 //   [ HeapObject header           ]

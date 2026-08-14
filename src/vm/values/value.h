@@ -95,6 +95,7 @@ enum class HeapObjectKind : uint8_t {
     kObject,
     kArray,
     kString,
+    kConsString,    // rope of two strings (lazy flatten)
     kFunction,
     kBoundFunction,
     kNumber,       // boxed HeapNumber
@@ -183,7 +184,9 @@ inline bool Value::IsNumber() const {
     return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kNumber;
 }
 inline bool Value::IsString() const {
-    return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kString;
+    if (!IsHeapObject()) return false;
+    HeapObjectKind k = raw_.AsHeapObject()->kind();
+    return k == HeapObjectKind::kString || k == HeapObjectKind::kConsString;
 }
 inline bool Value::IsObject() const {
     return IsHeapObject() && raw_.AsHeapObject()->kind() == HeapObjectKind::kObject;

@@ -67,6 +67,9 @@ constexpr OpInfo kOpInfos[] = {
 
     {Op::Inc,                "Inc",                OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
     {Op::Dec,                "Dec",                OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
+    {Op::IncReg,             "IncReg",             OperandKind::kReg,      OperandKind::kNone, OperandKind::kNone, 2},
+    {Op::DecReg,             "DecReg",             OperandKind::kReg,      OperandKind::kNone, OperandKind::kNone, 2},
+    {Op::AddConstToReg,      "AddConstToReg",      OperandKind::kReg,      OperandKind::kReg,  OperandKind::kNone, 3},
 
     {Op::Jump,               "Jump",               OperandKind::kJump,     OperandKind::kNone, OperandKind::kNone, 5},
     {Op::JumpIfTrue,         "JumpIfTrue",         OperandKind::kJump,     OperandKind::kNone, OperandKind::kNone, 5},

@@ -116,12 +116,17 @@ private:
     // the FunctionInfo referenced by a constant pool entry.
     BytecodeProgram* current_program_ = nullptr;
 
-    // The register storage backing all frame register files. We grow this
-    // dynamically as frames are pushed.
+    // The register storage backing all frame register files. Pre-allocated
+    // to max_depth_ * avg_regs_per_frame to avoid realloc during calls.
     std::vector<Value> reg_storage_;
+    size_t reg_stack_top_ = 0;  // current allocation watermark
 
-    // The frame stack.
-    std::vector<Frame> frames_;
+    // The frame stack. Fixed-capacity array (no vector realloc) so that
+    // frame pointers remain stable across calls. This eliminates the
+    // need for sync() after every Call.
+    static constexpr size_t kMaxFrames = 1024;
+    Frame frames_arr_[kMaxFrames];
+    size_t frame_count_ = 0;
 
     // Pending exception (set by Throw, cleared by TryCatch).
     Value pending_exception_;
@@ -140,9 +145,11 @@ private:
     Value* PushFrame(FunctionInfo* info, JSFunction* fn, Value this_val,
                      Context* closure_ctx, uint32_t argc, const Value* args);
 
-    // Pop the top frame. Returns the frame's saved register base so the
-    // caller can shrink reg_storage_.
+    // Pop the top frame.
     void PopFrame();
+
+    // Access the top frame (inline, no vector dereference).
+    Frame* TopFrame() { return &frames_arr_[frame_count_ - 1]; }
 
     // Read an operand at the current PC, advancing PC.
     // These use memcpy for multi-byte reads, which the compiler optimizes

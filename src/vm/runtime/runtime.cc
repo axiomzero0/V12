@@ -221,7 +221,8 @@ Value Typeof(Isolate* iso, Value v) {
     } else if (v.IsHeapObject()) {
         switch (v.AsHeapObject()->kind()) {
             case HeapObjectKind::kNumber:     s = "number"; break;
-            case HeapObjectKind::kString:     s = "string"; break;
+            case HeapObjectKind::kString:
+            case HeapObjectKind::kConsString: s = "string"; break;
             case HeapObjectKind::kBoolean:    s = "boolean"; break;
             case HeapObjectKind::kUndefined:  s = "undefined"; break;
             case HeapObjectKind::kFunction:
@@ -379,16 +380,29 @@ Value GreaterThanOrEqual(Isolate* iso, Value a, Value b) {
 // Arithmetic
 // -----------------------------------------------------------------------------
 Value Add(Isolate* iso, Value a, Value b) {
-    // String concatenation takes priority if either side is a string after
-    // ToPrimitive. For our value model, strings are always already
-    // primitives.
+    // String concatenation takes priority if either side is a string.
+    // Use ConsString for O(1) concatenation instead of O(n) copy.
     if (a.IsString() || b.IsString()) {
         Value sa = ToString(iso, a);
         Value sb = ToString(iso, b);
-        std::string out;
-        out += std::string(static_cast<JSString*>(sa.AsHeapObject())->view());
-        out += std::string(static_cast<JSString*>(sb.AsHeapObject())->view());
-        return Value::FromHeap(JSString::New(iso, out));
+        // If both are flat JSStrings, use ConsString (O(1) instead of O(n)).
+        // If either is already a ConsString, we could chain it, but for
+        // simplicity we just flatten and re-cons.
+        JSString* sa_flat = sa.AsHeapObject()->kind() == HeapObjectKind::kConsString
+                            ? static_cast<ConsString*>(sa.AsHeapObject())->Flatten(iso)
+                            : static_cast<JSString*>(sa.AsHeapObject());
+        JSString* sb_flat = sb.AsHeapObject()->kind() == HeapObjectKind::kConsString
+                            ? static_cast<ConsString*>(sb.AsHeapObject())->Flatten(iso)
+                            : static_cast<JSString*>(sb.AsHeapObject());
+        // For very small strings, just copy (ConsString overhead not worth it).
+        if (sa_flat->length() + sb_flat->length() < 16) {
+            std::string out;
+            out.reserve(sa_flat->length() + sb_flat->length());
+            out += std::string(sa_flat->data(), sa_flat->length());
+            out += std::string(sb_flat->data(), sb_flat->length());
+            return Value::FromHeap(JSString::New(iso, out));
+        }
+        return Value::FromHeap(ConsString::New(iso, sa_flat, sb_flat));
     }
     double x = ToDouble(iso, a);
     double y = ToDouble(iso, b);

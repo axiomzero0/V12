@@ -298,6 +298,18 @@ inline bool IsTruthyFast(Value v) {
 // The original version (kept for external callers that pass Isolate).
 bool IsTruthy(Isolate* iso, Value v);
 
+// Flatten a Value that IsString() into a flat JSString*. If the value is
+// already a flat JSString, returns it directly. If it's a ConsString,
+// flattens it (materializes the full string) and returns the flat result.
+// Call this before accessing ->data() or ->view() on a string.
+inline JSString* FlattenString(Isolate* iso, Value v) {
+    HeapObject* h = v.AsHeapObject();
+    if (h->kind() == HeapObjectKind::kConsString) {
+        return static_cast<ConsString*>(h)->Flatten(iso);
+    }
+    return static_cast<JSString*>(h);
+}
+
 }  // namespace v12
 
 #endif  // V12_VM_RUNTIME_RUNTIME_H_

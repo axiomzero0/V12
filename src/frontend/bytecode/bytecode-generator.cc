@@ -63,7 +63,80 @@ std::unique_ptr<BytecodeProgram> BytecodeGenerator::Compile(Program* prog) {
     top_fs.info->num_context_vars = 0;
 
     program_->toplevel = top_fs.info;
+
+    // Run peephole optimization on all functions.
+    for (auto& fi : program_->functions) {
+        PeepholeOptimize(fi.get());
+    }
+
     return std::move(program_);
+}
+
+// -----------------------------------------------------------------------------
+// Peephole optimization
+// -----------------------------------------------------------------------------
+size_t BytecodeGenerator::PeepholeOptimize(FunctionInfo* fi) {
+    // We rewrite the bytecode in place, replacing dead instruction bytes
+    // with Nop. This is safe because Nop is a 1-byte no-op, and we never
+    // change instruction offsets (jump targets remain valid).
+    //
+    // IMPORTANT: when we nop out an instruction, we must fill ALL its bytes
+    // with Nop (not just the opcode byte), because the dispatch loop reads
+    // the opcode byte and then skips the operand bytes based on the opcode's
+    // length. If we leave operand bytes, the next dispatch will interpret
+    // them as an opcode.
+    size_t removed = 0;
+    auto& bc = fi->bytecode;
+    size_t i = 0;
+    while (i < bc.size()) {
+        Op op = static_cast<Op>(bc[i]);
+        const OpInfo& oi = GetOpInfo(op);
+        size_t next = i + oi.length;
+        if (next >= bc.size()) break;
+
+        Op next_op = static_cast<Op>(bc[next]);
+        const OpInfo& next_oi = GetOpInfo(next_op);
+        size_t after_next = next + next_oi.length;
+
+        // Pattern: Ldar r; Star r  (same register — Star is a no-op)
+        if (op == Op::Ldar && next_op == Op::Star &&
+            oi.length == 2 && next_oi.length == 2 &&
+            bc[i + 1] == bc[next + 1]) {
+            // Nop out the Star (2 bytes).
+            bc[next] = static_cast<uint8_t>(Op::Nop);
+            bc[next + 1] = static_cast<uint8_t>(Op::Nop);
+            removed += 2;
+        }
+        // Pattern: Star r; Ldar r  (same register — Ldar is a no-op)
+        else if (op == Op::Star && next_op == Op::Ldar &&
+                   oi.length == 2 && next_oi.length == 2 &&
+                   bc[i + 1] == bc[next + 1]) {
+            bc[next] = static_cast<uint8_t>(Op::Nop);
+            bc[next + 1] = static_cast<uint8_t>(Op::Nop);
+            removed += 2;
+        }
+        // Pattern: LdaUndefined; Return → Nop; ReturnUndefined
+        else if (op == Op::LdaUndefined && next_op == Op::Return &&
+                   oi.length == 1 && next_oi.length == 1) {
+            bc[i] = static_cast<uint8_t>(Op::Nop);
+            bc[next] = static_cast<uint8_t>(Op::ReturnUndefined);
+            removed += 1;
+        }
+        // Pattern: Jump X where X == after_next (jump to next instruction)
+        else if (op == Op::Jump && oi.length == 5) {
+            uint32_t target = static_cast<uint32_t>(bc[i+1]) |
+                              (static_cast<uint32_t>(bc[i+2]) << 8) |
+                              (static_cast<uint32_t>(bc[i+3]) << 16) |
+                              (static_cast<uint32_t>(bc[i+4]) << 24);
+            if (target == static_cast<uint32_t>(after_next)) {
+                for (size_t j = i; j < next; ++j) bc[j] = static_cast<uint8_t>(Op::Nop);
+                removed += oi.length;
+            }
+        }
+
+        i = next;
+    }
+    return removed;
 }
 
 // -----------------------------------------------------------------------------
@@ -441,13 +514,27 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
             if (f->update) {
                 if (f->update->kind == AstKind::kUpdateOp) {
                     UpdateOp* u = static_cast<UpdateOp*>(f->update);
-                    // Load the operand, increment/decrement, store back.
-                    // No need to save the old value.
-                    EmitExpr(fs, u->operand);
-                    EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc) ? Op::Inc : Op::Dec);
-                    EmitIdx(fs, AllocFeedbackSlot(fs));
+                    // If the operand is a simple identifier (local register),
+                    // use the fused IncReg/DecReg opcode — one instruction
+                    // instead of Ldar+Inc+Star (three instructions).
                     if (u->operand->kind == AstKind::kIdentifier) {
-                        EmitStoreIdentifier(fs, static_cast<Identifier*>(u->operand));
+                        Identifier* id = static_cast<Identifier*>(u->operand);
+                        ResolvedVar rv = scope_analyzer_->Resolve(id->name, fs->scope);
+                        if (rv.location == VarLocation::kLocal) {
+                            EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc)
+                                       ? Op::IncReg : Op::DecReg);
+                            EmitReg(fs, rv.reg);
+                        } else {
+                            // Non-local (context/global) — fall back to acc path.
+                            EmitExpr(fs, u->operand);
+                            EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc) ? Op::Inc : Op::Dec);
+                            EmitIdx(fs, AllocFeedbackSlot(fs));
+                            EmitStoreIdentifier(fs, id);
+                        }
+                    } else {
+                        EmitExpr(fs, u->operand);
+                        EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc) ? Op::Inc : Op::Dec);
+                        EmitIdx(fs, AllocFeedbackSlot(fs));
                     }
                 } else {
                     EmitExpr(fs, f->update);
