@@ -148,7 +148,14 @@ InterpResult Interp::CallHostFunction(HostFunction* fn, Value this_val,
 //
 // This requires GCC or Clang. MSVC is not supported.
 // -----------------------------------------------------------------------------
+#ifdef V12_OPCODE_STATS
+// Global opcode dispatch counters (for profiling). Indexed by opcode byte.
+// Declared here and defined in the header so the benchmark tool can read them.
+uint64_t g_opcode_dispatch_counts[256] = {};
+#define V12_DISPATCH()  do { g_opcode_dispatch_counts[*pc]++; goto *dispatch_table[*pc++]; } while(0)
+#else
 #define V12_DISPATCH()  goto *dispatch_table[*pc++]
+#endif
 
 InterpResult Interp::ExecuteTop() {
     Frame* frame = &frames_.back();
@@ -254,7 +261,7 @@ InterpResult Interp::ExecuteTop() {
             // Hot path: try Smi fast path first, fall back to slow path.
             L_Add: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiAdd(acc, regs[r], &result))) {
                     acc = result;
@@ -265,7 +272,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Sub: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiSub(acc, regs[r], &result))) {
                     acc = result;
@@ -276,7 +283,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Mul: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiMul(acc, regs[r], &result))) {
                     acc = result;
@@ -287,26 +294,26 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Div: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 // No Smi fast path for Div (result may be non-integer).
                 acc = Div(iso_, acc, regs[r]);
                 V12_DISPATCH();
             }
             L_Mod: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Mod(iso_, acc, regs[r]);
                 V12_DISPATCH();
             }
             L_Exp: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Exp(iso_, acc, regs[r]);
                 V12_DISPATCH();
             }
             L_BitOr: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiBitOr(acc, regs[r], &result))) {
                     acc = result;
@@ -317,7 +324,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_BitAnd: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiBitAnd(acc, regs[r], &result))) {
                     acc = result;
@@ -328,7 +335,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_BitXor: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiBitXor(acc, regs[r], &result))) {
                     acc = result;
@@ -339,7 +346,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Shl: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiShl(acc, regs[r], &result))) {
                     acc = result;
@@ -350,7 +357,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Shr: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value result;
                 if (V12_LIKELY(TrySmiShr(acc, regs[r], &result))) {
                     acc = result;
@@ -361,7 +368,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_Ushr: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Ushr(iso_, acc, regs[r]);
                 V12_DISPATCH();
             }
@@ -370,19 +377,19 @@ InterpResult Interp::ExecuteTop() {
             // Format: op  const:32  idx:16
             L_AddConst: {
                 uint32_t cidx = ReadU32(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Add(iso_, acc, info->ResolveConstant(iso_, cidx));
                 V12_DISPATCH();
             }
             L_SubConst: {
                 uint32_t cidx = ReadU32(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Sub(iso_, acc, info->ResolveConstant(iso_, cidx));
                 V12_DISPATCH();
             }
             L_MulConst: {
                 uint32_t cidx = ReadU32(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Mul(iso_, acc, info->ResolveConstant(iso_, cidx));
                 V12_DISPATCH();
             }
@@ -390,12 +397,12 @@ InterpResult Interp::ExecuteTop() {
             // ----- Unary -----
             // Format: op  idx:16   (idx is a feedback slot)
             L_Negate: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Negate(iso_, acc);
                 V12_DISPATCH();
             }
             L_BitNot: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = BitNot(iso_, acc);
                 V12_DISPATCH();
             }
@@ -410,7 +417,7 @@ InterpResult Interp::ExecuteTop() {
             // Format: op  r:8  idx:16
             L_TestEqual: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -421,7 +428,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestNotEqual: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->false_value() : iso_->true_value();
@@ -433,7 +440,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestEqStrict: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -444,7 +451,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestNotEqStrict: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->false_value() : iso_->true_value();
@@ -456,7 +463,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestLessThan: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiLessThan(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -467,7 +474,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestGreaterThan: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiGreaterThan(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -478,7 +485,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestLessThanOrEqual: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiLessThanOrEqual(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -489,7 +496,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestGreaterThanOrEqual: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 bool result;
                 if (V12_LIKELY(TrySmiGreaterThanOrEqual(acc, regs[r], &result))) {
                     acc = result ? iso_->true_value() : iso_->false_value();
@@ -500,14 +507,14 @@ InterpResult Interp::ExecuteTop() {
             }
             L_TestInstanceOf: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 // instanceof not yet implemented; default to false.
                 acc = iso_->false_value();
                 V12_DISPATCH();
             }
             L_TestIn: {
                 uint8_t r = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value key = acc;
                 Value obj = regs[r];
                 if (obj.IsObject()) {
@@ -534,7 +541,7 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Inc / Dec -----
             L_Inc: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 // Fast path for Smi.
                 if (V12_LIKELY(acc.IsSmi())) {
                     intptr_t x = acc.AsSmi();
@@ -547,7 +554,7 @@ InterpResult Interp::ExecuteTop() {
                 V12_DISPATCH();
             }
             L_Dec: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (V12_LIKELY(acc.IsSmi())) {
                     intptr_t x = acc.AsSmi();
                     if (V12_LIKELY(SmiFitsFast(x - 1))) {
@@ -611,7 +618,7 @@ InterpResult Interp::ExecuteTop() {
             // LoadProperty: op  name_idx:8  idx:16
             L_LoadProperty: {
                 uint8_t name_idx = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 std::string_view name = info->property_names[name_idx];
                 if (acc.IsObject()) {
                     acc = acc.AsObject()->GetProperty(iso_, name);
@@ -636,7 +643,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_LoadIndexed: {
                 uint8_t idx_reg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value idx_val = regs[idx_reg];
                 if (acc.IsArray()) {
                     uint32_t idx = static_cast<uint32_t>(ToDouble(iso_, idx_val));
@@ -663,7 +670,7 @@ InterpResult Interp::ExecuteTop() {
             L_StoreProperty: {
                 uint8_t val_reg = ReadU8(&pc);
                 uint8_t name_idx = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 std::string_view name = info->property_names[name_idx];
                 Value value = regs[val_reg];
                 if (acc.IsObject()) {
@@ -674,7 +681,7 @@ InterpResult Interp::ExecuteTop() {
             L_StoreIndexed: {
                 uint8_t idx_reg = ReadU8(&pc);
                 uint8_t val_reg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value idx_val = regs[idx_reg];
                 Value value = regs[val_reg];
                 if (acc.IsArray()) {
@@ -688,16 +695,36 @@ InterpResult Interp::ExecuteTop() {
             // LoadGlobal: op  name_idx:8  idx:16
             L_LoadGlobal: {
                 uint8_t name_idx = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
+                // Inline the global property lookup for speed. The global
+                // object's shape is stable (globals are registered before
+                // execution), so we could cache the slot. For now, just
+                // do the lookup directly.
+                JSObject* g = iso_->global_object();
+                Shape* shape = g->shape();
+                Shape::Slot slot = Shape::kInvalidSlot;
+                // Linear scan the shape's properties for the name.
+                // (Property names are interned, so string_view comparison
+                //  is fast: size check + memcmp.)
                 std::string_view name = info->property_names[name_idx];
-                acc = iso_->GetGlobal(name);
+                for (uint16_t i = 0; i < shape->property_count(); ++i) {
+                    if (shape->PropertyNameAt(i) == name) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot != Shape::kInvalidSlot) {
+                    acc = g->properties()[slot];
+                } else {
+                    acc = iso_->undefined_value();
+                }
                 V12_DISPATCH();
             }
             // StoreGlobal: op  r:8  name_idx:8  idx:16
             L_StoreGlobal: {
                 (void)ReadU8(&pc);   // dummy register
                 uint8_t name_idx = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 std::string_view name = info->property_names[name_idx];
                 iso_->SetGlobal(name, acc);
                 V12_DISPATCH();
@@ -706,7 +733,7 @@ InterpResult Interp::ExecuteTop() {
             L_LoadContext: {
                 uint16_t depth = ReadU16(&pc);
                 uint16_t index = ReadU16(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (ctx != nullptr) {
                     acc = ctx->LoadAt(depth, index);
                 } else {
@@ -719,7 +746,7 @@ InterpResult Interp::ExecuteTop() {
                 (void)ReadU8(&pc);
                 uint16_t depth = ReadU16(&pc);
                 uint16_t index = ReadU16(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (ctx != nullptr) {
                     ctx->StoreAt(depth, index, acc);
                 }
@@ -739,7 +766,7 @@ InterpResult Interp::ExecuteTop() {
                     (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
 
                 Value this_val = iso_->undefined_value();
                 Value callee = acc;
@@ -788,7 +815,7 @@ InterpResult Interp::ExecuteTop() {
                 uint16_t argc = ReadU16(&pc);
                 uint8_t prop_idx = ReadU8(&pc);
                 uint8_t first_arg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
 
                 Value receiver = acc;
                 Value* args = regs + first_arg;
@@ -925,18 +952,18 @@ InterpResult Interp::ExecuteTop() {
                 uint32_t argc = 0;
                 if (opcode_byte == static_cast<uint8_t>(Op::Call1)) {
                     uint8_t r = ReadU8(&pc);
-                    (void)ReadU16(&pc);
+                    pc += 2;
                     argbuf[0] = regs[r];
                     argc = 1;
                 } else if (opcode_byte == static_cast<uint8_t>(Op::Call2)) {
                     uint8_t r1 = ReadU8(&pc);
                     uint8_t r2 = ReadU8(&pc);
-                    (void)ReadU16(&pc);
+                    pc += 2;
                     argbuf[0] = regs[r1];
                     argbuf[1] = regs[r2];
                     argc = 2;
                 } else {
-                    (void)ReadU16(&pc);
+                    pc += 2;
                 }
                 frame->pc = pc;
                 InterpResult r;
@@ -982,7 +1009,7 @@ InterpResult Interp::ExecuteTop() {
                     (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value callee = acc;
                 Value* args = regs + first_arg;
                 Value new_obj = Value::FromHeap(JSObject::New(iso_));
@@ -1029,7 +1056,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_CallBuiltin: {
                 (void)ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 (void)ReadU8(&pc);
                 acc = iso_->undefined_value();
                 V12_DISPATCH();
@@ -1068,7 +1095,7 @@ InterpResult Interp::ExecuteTop() {
             // PushArray: op  arr_reg:8  idx:16
             L_PushArray: {
                 uint8_t arr_reg = ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 Value arr = regs[arr_reg];
                 if (arr.IsArray()) {
                     arr.AsArray()->Push(iso_, acc);
@@ -1077,7 +1104,7 @@ InterpResult Interp::ExecuteTop() {
             }
             // LoadArrayLength: op  idx:16
             L_LoadArrayLength: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (acc.IsArray()) {
                     acc = Value::FromSmi(static_cast<intptr_t>(acc.AsArray()->length()));
                 } else {
@@ -1087,7 +1114,7 @@ InterpResult Interp::ExecuteTop() {
             }
             L_StoreArrayLength: {
                 (void)ReadU8(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 // Setting .length is a no-op for now.
                 V12_DISPATCH();
             }
@@ -1096,13 +1123,13 @@ InterpResult Interp::ExecuteTop() {
             // CreateContext: op  slot_count:16  idx:16
             L_CreateContext: {
                 uint16_t slot_count = ReadU16(&pc);
-                (void)ReadU16(&pc);
+                pc += 2;
                 acc = Value::FromHeap(Context::New(iso_, ctx, slot_count));
                 V12_DISPATCH();
             }
             // PushContext: op  idx:16
             L_PushContext: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (acc.IsHeapObject()) {
                     ctx = static_cast<Context*>(acc.AsHeapObject());
                     frame->context = ctx;
@@ -1111,7 +1138,7 @@ InterpResult Interp::ExecuteTop() {
             }
             // PopContext: op  idx:16
             L_PopContext: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 if (ctx != nullptr) {
                     ctx = ctx->parent();
                     frame->context = ctx;
@@ -1121,7 +1148,7 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Iteration -----
             L_ObjectKeys: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 // Create an array of property name strings from acc.
                 JSArray* arr = JSArray::New(iso_, 4);
                 if (acc.IsObject()) {
@@ -1144,7 +1171,7 @@ InterpResult Interp::ExecuteTop() {
                 V12_DISPATCH();
             }
             L_GetIterator: {
-                (void)ReadU16(&pc);
+                pc += 2;
                 // For arrays and strings, the receiver itself is the
                 // "iterator" (for-of uses indexed access with a counter).
                 // No transformation needed.

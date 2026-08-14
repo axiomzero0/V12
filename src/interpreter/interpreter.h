@@ -41,6 +41,7 @@
 #define V12_INTERPRETER_INTERPRETER_H_
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -141,21 +142,22 @@ private:
     void PopFrame();
 
     // Read an operand at the current PC, advancing PC.
+    // These use memcpy for multi-byte reads, which the compiler optimizes
+    // to a single load instruction on x86/ARM (much faster than byte-by-byte
+    // assembly with shifts).
     uint8_t ReadU8(const uint8_t** pc) {
         uint8_t v = **pc; ++(*pc); return v;
     }
     uint16_t ReadU16(const uint8_t** pc) {
-        uint16_t v = static_cast<uint16_t>(**pc);
-        ++(*pc);
-        v |= static_cast<uint16_t>(**pc) << 8;
-        ++(*pc);
+        uint16_t v;
+        std::memcpy(&v, *pc, 2);
+        *pc += 2;
         return v;
     }
     uint32_t ReadU32(const uint8_t** pc) {
-        uint32_t v = static_cast<uint32_t>(**pc); ++(*pc);
-        v |= static_cast<uint32_t>(**pc) << 8; ++(*pc);
-        v |= static_cast<uint32_t>(**pc) << 16; ++(*pc);
-        v |= static_cast<uint32_t>(**pc) << 24; ++(*pc);
+        uint32_t v;
+        std::memcpy(&v, *pc, 4);
+        *pc += 4;
         return v;
     }
 

@@ -95,6 +95,11 @@ public:
     // file).
     Binding* Declare(std::string_view name, bool is_const = false);
 
+    // Declare a variable as a global (on the global object). Used for
+    // top-level function declarations so they're accessible from nested
+    // functions without closure capture.
+    Binding* DeclareGlobal(std::string_view name);
+
     // Declare a parameter in this scope. Parameters occupy registers
     // 0..num_params-1 (assigned in order). Must be called before Declare
     // for any local variable.

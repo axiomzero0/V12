@@ -28,18 +28,33 @@ Binding* Scope::Declare(std::string_view name, bool is_const) {
     }
     Binding b;
     b.name = name;
-    b.location = (kind_ == Kind::kGlobal) ? VarLocation::kGlobal : VarLocation::kLocal;
-    if (kind_ == Kind::kFunction) {
+    // The global scope acts as the toplevel function's scope — top-level
+    // let/var/const get local registers (not global object properties).
+    // This is a major performance win: top-level loop variables avoid
+    // LoadGlobal/StoreGlobal per iteration.
+    if (kind_ == Kind::kFunction || kind_ == Kind::kGlobal) {
+        b.location = VarLocation::kLocal;
         b.reg = AllocLocal();
     } else if (kind_ == Kind::kBlock) {
-        // Block-local variables share the enclosing function's register file.
-        // Walk up to the nearest function scope and allocate from there.
+        b.location = VarLocation::kLocal;
         b.reg = AllocBlockLocal();
     } else {
-        // Global: no register.
+        b.location = VarLocation::kGlobal;
         b.reg = 0;
     }
     b.is_const = is_const;
+    bindings_.push_back(b);
+    return &bindings_.back();
+}
+
+Binding* Scope::DeclareGlobal(std::string_view name) {
+    for (auto& b : bindings_) {
+        if (b.name == name) return &b;
+    }
+    Binding b;
+    b.name = name;
+    b.location = VarLocation::kGlobal;
+    b.reg = 0;
     bindings_.push_back(b);
     return &bindings_.back();
 }
@@ -138,7 +153,15 @@ void ScopeAnalyzer::VisitStmt(Stmt* s, Scope* current) {
         case AstKind::kFunctionDecl: {
             FunctionDecl* fd = static_cast<FunctionDecl*>(s);
             // The function name is declared in the enclosing scope.
-            current->Declare(fd->name);
+            // Top-level function declarations go on the global object so
+            // they're accessible from nested functions without closure
+            // capture. Function declarations inside other functions use
+            // normal local declaration (closure capture handles access).
+            if (current->kind() == Scope::Kind::kGlobal) {
+                current->DeclareGlobal(fd->name);
+            } else {
+                current->Declare(fd->name);
+            }
             // The function body gets its own scope.
             Scope* fn_scope = arena_->New<Scope>(Scope::Kind::kFunction, current, arena_);
             fn_scope->SetParameterCount(static_cast<uint16_t>(fd->params.size()));

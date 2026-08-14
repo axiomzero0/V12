@@ -62,6 +62,11 @@ Shape* Shape::LookupTransition(std::string_view name) const {
 }
 
 Shape::Slot Shape::Lookup(std::string_view name) const {
+    // Property names in shapes are interned (same pointer for same string).
+    // But `name` might not be interned, so we can't always use pointer
+    // comparison. However, string_view comparison is still fast (size check
+    // + memcmp). For hot paths like LoadGlobal, the interpreter should cache
+    // the slot index instead of calling this every time.
     for (const auto& p : properties_) {
         if (p.name == name) return p.slot;
     }

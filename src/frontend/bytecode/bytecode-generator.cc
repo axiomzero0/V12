@@ -435,7 +435,24 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
             fs->loops.push_back({{}, {}, loop_start});
             EmitStmt(fs, f->body);
             uint32_t update_target = Here(fs);
-            if (f->update) EmitExpr(fs, f->update);
+            // The for-loop update expression's value is discarded, so we
+            // can use a specialized path for ++/-- that avoids saving the
+            // old value (which postfix normally does for its return value).
+            if (f->update) {
+                if (f->update->kind == AstKind::kUpdateOp) {
+                    UpdateOp* u = static_cast<UpdateOp*>(f->update);
+                    // Load the operand, increment/decrement, store back.
+                    // No need to save the old value.
+                    EmitExpr(fs, u->operand);
+                    EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc) ? Op::Inc : Op::Dec);
+                    EmitIdx(fs, AllocFeedbackSlot(fs));
+                    if (u->operand->kind == AstKind::kIdentifier) {
+                        EmitStoreIdentifier(fs, static_cast<Identifier*>(u->operand));
+                    }
+                } else {
+                    EmitExpr(fs, f->update);
+                }
+            }
             EmitOp(fs, Op::JumpLoop);
             EmitImm32(fs, loop_start);
             uint32_t loop_end = Here(fs);
@@ -768,26 +785,17 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
             return;
         case AstKind::kBinaryOp: {
             BinaryOp* b = static_cast<BinaryOp*>(e);
-            // Evaluate left into acc, spill to a temp, evaluate right into acc,
-            // then emit the binary op with the temp as the second operand.
-            EmitExpr(fs, b->left);
+            // The bytecode op `op r, idx` computes `acc = acc <op> r`.
+            // So we need: acc = left, r = right.
+            // Evaluate right first, spill to temp, then evaluate left into acc.
+            // This avoids a swap (the old code evaluated left first, then
+            // had to swap left/right via two extra Star/Ldar instructions).
+            EmitExpr(fs, b->right);
             uint8_t tmp = AllocTemp(fs);
             EmitOp(fs, Op::Star);
             EmitReg(fs, tmp);
-            EmitExpr(fs, b->right);
-            // Now acc = right, tmp = left. The op form is `op reg, idx`.
-            // But we want `acc = op(left, right) = op(tmp, acc)`. The bytecode
-            // semantics is `acc = acc <op> reg`, which would compute
-            // right <op> left — wrong for non-commutative ops like Sub.
-            //
-            // Solution: swap. Move acc (right) into a second temp, load tmp
-            // (left) into acc, then emit `op right_tmp, idx`.
-            uint8_t tmp2 = AllocTemp(fs);
-            EmitOp(fs, Op::Star);
-            EmitReg(fs, tmp2);
-            EmitOp(fs, Op::Ldar);
-            EmitReg(fs, tmp);
-            // Now acc = left, tmp2 = right.
+            EmitExpr(fs, b->left);
+            // Now acc = left, tmp = right.
             Op op = Op::Illegal;
             switch (b->op_token) {
                 case static_cast<int>(TokenKind::kPlus):    op = Op::Add; break;
@@ -815,7 +823,7 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
                     return;
             }
             EmitOp(fs, op);
-            EmitReg(fs, tmp2);
+            EmitReg(fs, tmp);
             EmitIdx(fs, AllocFeedbackSlot(fs));
             return;
         }
@@ -915,30 +923,23 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
                     EmitReg(fs, val_tmp);
                 }
             } else {
-                // Compound assignment: desugar `x op= y` to `x = x op y`.
-                // For simplicity, only identifier targets supported.
+                // Compound assignment: `x op= y` compiles to:
+                //   EmitExpr(value)     -> acc = RHS
+                //   Star rhs_tmp        -> rhs_tmp = RHS
+                //   EmitLoadIdentifier  -> acc = x
+                //   op rhs_tmp          -> acc = x op RHS
+                //   EmitStoreIdentifier -> x = acc
+                // This is 5 instructions. The old code did 9 instructions
+                // with a wasteful swap dance.
                 if (a->target->kind == AstKind::kIdentifier) {
                     Identifier* id = static_cast<Identifier*>(a->target);
-                    // Save the RHS value into a temp.
                     uint8_t rhs_tmp = AllocTemp(fs);
+                    EmitExpr(fs, a->value);
                     EmitOp(fs, Op::Star);
                     EmitReg(fs, rhs_tmp);
-                    // Load the current value of x.
                     EmitLoadIdentifier(fs, id);
-                    // Spill to temp.
-                    uint8_t lhs_tmp = AllocTemp(fs);
-                    EmitOp(fs, Op::Star);
-                    EmitReg(fs, lhs_tmp);
-                    // Load RHS.
-                    EmitOp(fs, Op::Ldar);
-                    EmitReg(fs, rhs_tmp);
-                    // Swap so acc = lhs, rhs_tmp = rhs.
-                    uint8_t rhs_tmp2 = AllocTemp(fs);
-                    EmitOp(fs, Op::Star);
-                    EmitReg(fs, rhs_tmp2);
-                    EmitOp(fs, Op::Ldar);
-                    EmitReg(fs, lhs_tmp);
-                    // Now acc = lhs, rhs_tmp2 = rhs.
+                    // Now acc = x (left), rhs_tmp = RHS (right).
+                    // `op r` does `acc = acc op r` = `x op RHS`. Correct.
                     Op op = Op::Illegal;
                     switch (a->op_token) {
                         case static_cast<int>(TokenKind::kAddAssign): op = Op::Add; break;
@@ -955,9 +956,8 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
                         default: EmitOp(fs, Op::Illegal); return;
                     }
                     EmitOp(fs, op);
-                    EmitReg(fs, rhs_tmp2);
+                    EmitReg(fs, rhs_tmp);
                     EmitIdx(fs, AllocFeedbackSlot(fs));
-                    // Store back.
                     EmitStoreIdentifier(fs, id);
                 }
             }
