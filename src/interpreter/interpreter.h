@@ -129,7 +129,10 @@ private:
     uint32_t max_depth_ = 1000;
 
     // Execute the top frame on the frame stack until it returns or throws.
-    InterpResult ExecuteTop();
+    // Marked [[gnu::hot]] and [[gnu::flatten]] so the compiler prioritizes
+    // inlining this function and its callees (TrySmiAdd, IsTruthyFast, etc.)
+    // into the dispatch loop.
+    [[gnu::hot, gnu::flatten]] InterpResult ExecuteTop();
 
     // Push a new frame for `fn` with `argc` arguments. Returns a pointer
     // to the new frame's register file. The caller fills registers 0..argc-1

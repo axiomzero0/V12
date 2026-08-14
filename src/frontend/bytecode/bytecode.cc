@@ -20,6 +20,7 @@ namespace {
 constexpr OpInfo kOpInfos[] = {
     {Op::LdaConst,           "LdaConst",           OperandKind::kConst,    OperandKind::kNone, OperandKind::kNone, 5},
     {Op::LdaSmi,             "LdaSmi",             OperandKind::kImm8,     OperandKind::kNone, OperandKind::kNone, 2},
+    {Op::LdaSmi16,           "LdaSmi16",           OperandKind::kImm16,    OperandKind::kNone, OperandKind::kNone, 3},
     {Op::LdaZero,            "LdaZero",            OperandKind::kNone,     OperandKind::kNone, OperandKind::kNone, 1},
     {Op::LdaUndefined,       "LdaUndefined",       OperandKind::kNone,     OperandKind::kNone, OperandKind::kNone, 1},
     {Op::LdaNull,            "LdaNull",            OperandKind::kNone,     OperandKind::kNone, OperandKind::kNone, 1},

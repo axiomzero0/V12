@@ -21,6 +21,7 @@
 #include <cmath>
 
 #include "vm/objects/object.h"
+#include "vm/objects/primitives.h"
 #include "vm/values/value.h"
 
 namespace v12 {
@@ -269,10 +270,30 @@ inline bool TrySmiStrictEquals(Value a, Value b, bool* result) {
 }
 
 // Returns true if the value is "truthy" per JS semantics.
-// This is the fast version used by the interpreter's JumpIf* handlers.
-// It's declared here and defined in runtime.cc (it needs the full
-// definitions of JSBoolean, JSNumber, JSString which are incomplete here).
-bool IsTruthyFast(Value v);
+// INLINE — used by every JumpIf* opcode handler (5 opcodes). Avoids a
+// function call on the hot dispatch path.
+inline bool IsTruthyFast(Value v) {
+    if (v.IsSmi()) return v.AsSmi() != 0;
+    if (v.IsHeapObject()) {
+        HeapObject* h = v.AsHeapObject();
+        switch (h->kind()) {
+            case HeapObjectKind::kUndefined:
+            case HeapObjectKind::kNull:
+                return false;
+            case HeapObjectKind::kBoolean:
+                return static_cast<JSBoolean*>(h)->value();
+            case HeapObjectKind::kNumber: {
+                double d = static_cast<JSNumber*>(h)->value();
+                return d != 0.0 && !std::isnan(d);
+            }
+            case HeapObjectKind::kString:
+                return static_cast<JSString*>(h)->length() != 0;
+            default:
+                return true;
+        }
+    }
+    return false;
+}
 
 // The original version (kept for external callers that pass Isolate).
 bool IsTruthy(Isolate* iso, Value v);

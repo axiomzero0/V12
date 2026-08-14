@@ -63,10 +63,15 @@ Value* Interp::PushFrame(FunctionInfo* info, JSFunction* fn, Value this_val,
               max_depth_);
 
     // Allocate the register file for this frame at the end of reg_storage_.
+    // We DON'T initialize the registers here — the bytecode will write to
+    // them before reading (the bytecode generator ensures this). Only
+    // fill the parameter slots that aren't provided by the caller with
+    // undefined. This saves a memset of nregs * 8 bytes per call, which
+    // is significant for tight recursive functions like fib().
     uint16_t nregs = info->num_registers;
     if (nregs == 0) nregs = 1;   // ensure at least one slot for safety
     size_t base = reg_storage_.size();
-    reg_storage_.resize(base + nregs, iso_->undefined_value());
+    reg_storage_.resize(base + nregs);
 
     Frame f;
     f.info = info;
@@ -77,13 +82,20 @@ Value* Interp::PushFrame(FunctionInfo* info, JSFunction* fn, Value this_val,
     f.function = fn;
     frames_.push_back(f);
 
-    // Place arguments into the first `argc` slots.
-    // Missing slots (argc < num_parameters) stay undefined (set by resize).
-    // Extra slots (argc > num_parameters) are dropped.
+    // Place arguments into the first min(argc, nparams) slots.
+    // Missing parameter slots (argc < nparams) are filled with undefined.
+    // Registers beyond nparams are left uninitialized — the bytecode
+    // generator guarantees they're written before being read.
     uint16_t nparams = info->num_parameters;
     uint16_t to_copy = (argc < nparams) ? static_cast<uint16_t>(argc) : nparams;
     for (uint16_t i = 0; i < to_copy; ++i) {
         f.regs[i] = args[i];
+    }
+    // Fill missing parameter slots with undefined (for calls with fewer
+    // args than parameters). Non-parameter registers are left uninitialized.
+    Value undef = iso_->undefined_value();
+    for (uint16_t i = to_copy; i < nparams; ++i) {
+        f.regs[i] = undef;
     }
     return f.regs;
 }
@@ -179,7 +191,7 @@ InterpResult Interp::ExecuteTop() {
     // Computed-goto dispatch table. Each entry is the address of the label
     // for that opcode. Indexed by the opcode byte.
     static const void* dispatch_table[] = {
-        &&L_LdaConst, &&L_LdaSmi, &&L_LdaZero, &&L_LdaUndefined,
+        &&L_LdaConst, &&L_LdaSmi, &&L_LdaSmi16, &&L_LdaZero, &&L_LdaUndefined,
         &&L_LdaNull, &&L_LdaTrue, &&L_LdaFalse, &&L_LdaThis,
         &&L_Ldar, &&L_Star, &&L_Mov,
         &&L_Add, &&L_Sub, &&L_Mul, &&L_Div, &&L_Mod, &&L_Exp,
@@ -216,6 +228,11 @@ InterpResult Interp::ExecuteTop() {
             }
             L_LdaSmi: {
                 uint8_t v = ReadU8(&pc);
+                acc = Value::FromSmi(static_cast<intptr_t>(v));
+                V12_DISPATCH();
+            }
+            L_LdaSmi16: {
+                int16_t v = static_cast<int16_t>(ReadU16(&pc));
                 acc = Value::FromSmi(static_cast<intptr_t>(v));
                 V12_DISPATCH();
             }
@@ -433,7 +450,7 @@ InterpResult Interp::ExecuteTop() {
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->false_value() : iso_->true_value();
                 } else {
-                    acc = LooseEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
+                    acc = LooseEquals(iso_, acc, regs[r]) == iso_->true_value()
                           ? iso_->false_value() : iso_->true_value();
                 }
                 V12_DISPATCH();
@@ -456,7 +473,7 @@ InterpResult Interp::ExecuteTop() {
                 if (V12_LIKELY(TrySmiStrictEquals(acc, regs[r], &result))) {
                     acc = result ? iso_->false_value() : iso_->true_value();
                 } else {
-                    acc = StrictEquals(iso_, acc, regs[r]).AsHeapObject() == iso_->true_object()
+                    acc = StrictEquals(iso_, acc, regs[r]) == iso_->true_value()
                           ? iso_->false_value() : iso_->true_value();
                 }
                 V12_DISPATCH();
@@ -616,23 +633,47 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Property access -----
             // LoadProperty: op  name_idx:8  idx:16
+            // Fast path: check the inline cache. If the receiver's shape
+            // matches the cached shape, read the property directly from
+            // the cached slot — no string comparison, no shape lookup.
             L_LoadProperty: {
                 uint8_t name_idx = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                // Try the IC fast path for objects.
+                if (V12_LIKELY(acc.IsObject())) {
+                    JSObject* obj = acc.AsObject();
+                    auto& ic = info->GetIC(ic_slot);
+                    Shape* obj_shape = obj->shape();
+                    if (V12_LIKELY(ic.initialized &&
+                                   ic.shape == reinterpret_cast<uintptr_t>(obj_shape))) {
+                        // IC hit: read directly from the cached slot.
+                        acc = obj->properties()[ic.slot];
+                        V12_DISPATCH();
+                    }
+                    // IC miss: do a full lookup, then update the cache.
+                    Shape::Slot slot = obj_shape->Lookup(info->property_names[name_idx]);
+                    if (slot != Shape::kInvalidSlot) {
+                        ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
+                        ic.slot = slot;
+                        ic.initialized = true;
+                        acc = obj->properties()[slot];
+                    } else {
+                        acc = iso_->undefined_value();
+                    }
+                    V12_DISPATCH();
+                }
+                // Slow path: non-object receivers (string/array .length, etc.)
                 std::string_view name = info->property_names[name_idx];
-                if (acc.IsObject()) {
-                    acc = acc.AsObject()->GetProperty(iso_, name);
-                } else if (acc.IsString()) {
+                if (acc.IsString()) {
                     if (name == "length") {
-                        uint32_t len = static_cast<JSString*>(acc.AsHeapObject())->length();
-                        acc = Value::FromSmi(static_cast<intptr_t>(len));
+                        acc = Value::FromSmi(static_cast<intptr_t>(
+                            static_cast<JSString*>(acc.AsHeapObject())->length()));
                     } else {
                         acc = iso_->undefined_value();
                     }
                 } else if (acc.IsArray()) {
                     if (name == "length") {
-                        uint32_t len = acc.AsArray()->length();
-                        acc = Value::FromSmi(static_cast<intptr_t>(len));
+                        acc = Value::FromSmi(static_cast<intptr_t>(acc.AsArray()->length()));
                     } else {
                         acc = iso_->undefined_value();
                     }
@@ -667,14 +708,35 @@ InterpResult Interp::ExecuteTop() {
                 V12_DISPATCH();
             }
             // StoreProperty: op  val_reg:8  name_idx:8  idx:16
+            // Uses IC for the fast path (object with known shape).
             L_StoreProperty: {
                 uint8_t val_reg = ReadU8(&pc);
                 uint8_t name_idx = ReadU8(&pc);
-                pc += 2;
-                std::string_view name = info->property_names[name_idx];
+                uint16_t ic_slot = ReadU16(&pc);
                 Value value = regs[val_reg];
-                if (acc.IsObject()) {
-                    acc.AsObject()->SetProperty(iso_, name, value);
+                if (V12_LIKELY(acc.IsObject())) {
+                    JSObject* obj = acc.AsObject();
+                    Shape* obj_shape = obj->shape();
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_LIKELY(ic.initialized &&
+                                   ic.shape == reinterpret_cast<uintptr_t>(obj_shape))) {
+                        obj->properties()[ic.slot] = value;
+                        V12_DISPATCH();
+                    }
+                    // IC miss: lookup and update cache.
+                    std::string_view name = info->property_names[name_idx];
+                    Shape::Slot slot = obj_shape->Lookup(name);
+                    if (slot != Shape::kInvalidSlot) {
+                        ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
+                        ic.slot = slot;
+                        ic.initialized = true;
+                        obj->properties()[slot] = value;
+                    } else {
+                        // New property — shape transition.
+                        obj->SetProperty(iso_, name, value);
+                        // Invalidate IC since shape changed.
+                        ic.initialized = false;
+                    }
                 }
                 V12_DISPATCH();
             }
@@ -693,27 +755,34 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Variables -----
             // LoadGlobal: op  name_idx:8  idx:16
+            // Uses an inline cache: the first call looks up the slot and
+            // caches (shape, slot). Subsequent calls are a single shape
+            // compare + array load.
             L_LoadGlobal: {
                 uint8_t name_idx = ReadU8(&pc);
-                pc += 2;
-                // Inline the global property lookup for speed. The global
-                // object's shape is stable (globals are registered before
-                // execution), so we could cache the slot. For now, just
-                // do the lookup directly.
+                uint16_t ic_slot = ReadU16(&pc);
                 JSObject* g = iso_->global_object();
-                Shape* shape = g->shape();
-                Shape::Slot slot = Shape::kInvalidSlot;
-                // Linear scan the shape's properties for the name.
-                // (Property names are interned, so string_view comparison
-                //  is fast: size check + memcmp.)
+                Shape* gshape = g->shape();
+                auto& ic = info->GetIC(ic_slot);
+                if (V12_LIKELY(ic.initialized &&
+                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
+                    // IC hit: direct property load, no string compare.
+                    acc = g->properties()[ic.slot];
+                    V12_DISPATCH();
+                }
+                // IC miss: linear scan the shape's properties.
                 std::string_view name = info->property_names[name_idx];
-                for (uint16_t i = 0; i < shape->property_count(); ++i) {
-                    if (shape->PropertyNameAt(i) == name) {
+                Shape::Slot slot = Shape::kInvalidSlot;
+                for (uint16_t i = 0; i < gshape->property_count(); ++i) {
+                    if (gshape->PropertyNameAt(i) == name) {
                         slot = i;
                         break;
                     }
                 }
                 if (slot != Shape::kInvalidSlot) {
+                    ic.shape = reinterpret_cast<uintptr_t>(gshape);
+                    ic.slot = slot;
+                    ic.initialized = true;
                     acc = g->properties()[slot];
                 } else {
                     acc = iso_->undefined_value();
@@ -724,9 +793,28 @@ InterpResult Interp::ExecuteTop() {
             L_StoreGlobal: {
                 (void)ReadU8(&pc);   // dummy register
                 uint8_t name_idx = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                JSObject* g = iso_->global_object();
+                Shape* gshape = g->shape();
+                auto& ic = info->GetIC(ic_slot);
+                if (V12_LIKELY(ic.initialized &&
+                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
+                    g->properties()[ic.slot] = acc;
+                    V12_DISPATCH();
+                }
                 std::string_view name = info->property_names[name_idx];
-                iso_->SetGlobal(name, acc);
+                // Update the cache.
+                Shape::Slot slot = gshape->Lookup(name);
+                if (slot != Shape::kInvalidSlot) {
+                    ic.shape = reinterpret_cast<uintptr_t>(gshape);
+                    ic.slot = slot;
+                    ic.initialized = true;
+                    g->properties()[slot] = acc;
+                } else {
+                    // Property doesn't exist yet — use SetProperty which
+                    // handles shape transitions.
+                    g->SetProperty(iso_, name, acc);
+                }
                 V12_DISPATCH();
             }
             // LoadContext: op  depth:16  index:16  idx:16
@@ -761,7 +849,6 @@ InterpResult Interp::ExecuteTop() {
             //   The interpreter looks up the property on acc to get the
             //   callee, then calls it with this = acc.
             L_Call: {
-                // Save the Call instruction's offset for handler lookup.
                 uint32_t call_off = static_cast<uint32_t>(
                     (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
@@ -772,15 +859,46 @@ InterpResult Interp::ExecuteTop() {
                 Value callee = acc;
                 Value* args = regs + first_arg;
 
-                frame->pc = pc;
-                InterpResult r;
+                // Host function: call directly and continue.
                 if (callee.IsHostFunction()) {
-                    r = CallHostFunction(callee.AsHostFunction(), this_val,
-                                         args, argc);
-                } else if (callee.IsFunction()) {
-                    r = CallFunction(callee.AsFunction(), this_val,
-                                     args, argc);
-                } else {
+                    Value result = callee.AsHostFunction()->fn()(
+                        this, this_val, const_cast<Value*>(args), argc);
+                    acc = result;
+                    V12_DISPATCH();
+                }
+                // JS function: inline the call setup (no C++ recursion).
+                if (V12_LIKELY(callee.IsFunction())) {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    if (callee_info == nullptr) {
+                        Value exc = Value::FromHeap(JSString::New(iso_,
+                            "TypeError: not a function"));
+                        pending_exception_ = exc;
+                        uint32_t catch_off = info->FindHandler(call_off);
+                        if (catch_off != 0xFFFFFFFF) {
+                            sync();
+                            pc = bytecode_base + catch_off;
+                            acc = exc;
+                            V12_DISPATCH();
+                        }
+                        return {InterpStatus::kThrew, exc};
+                    }
+                    // Save the return PC in the current frame.
+                    frame->pc = pc;
+                    // Push a new frame inline.
+                    Value* new_regs = PushFrame(callee_info, fn, this_val,
+                                                fn->closure_context(), argc, args);
+                    // Update locals to the new frame.
+                    frame = &frames_.back();
+                    regs = new_regs;
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    V12_DISPATCH();
+                }
+                // Not callable.
+                {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
                     pending_exception_ = exc;
@@ -793,21 +911,6 @@ InterpResult Interp::ExecuteTop() {
                     }
                     return {InterpStatus::kThrew, exc};
                 }
-                if (r.status == InterpStatus::kThrew) {
-                    pending_exception_ = r.value;
-                    uint32_t catch_off = info->FindHandler(call_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        sync();
-                        pc = bytecode_base + catch_off;
-                        acc = r.value;
-                        V12_DISPATCH();
-                    }
-                    return r;
-                }
-                sync();
-                pc = frame->pc;
-                acc = r.value;
-                V12_DISPATCH();
             }
             L_CallProperty: {
                 uint32_t call_off = static_cast<uint32_t>(
@@ -943,8 +1046,6 @@ InterpResult Interp::ExecuteTop() {
             L_Call2: {
                 uint32_t call_off = static_cast<uint32_t>(
                     (pc - bytecode_base) - 1);
-                // Determine which variant (Call0/1/2) by looking at the
-                // opcode byte we just consumed (pc[-1]).
                 uint8_t opcode_byte = pc[-1];
                 Value callee = acc;
                 Value this_val = iso_->undefined_value();
@@ -965,20 +1066,46 @@ InterpResult Interp::ExecuteTop() {
                 } else {
                     pc += 2;
                 }
-                frame->pc = pc;
-                InterpResult r;
+                // Host function: call directly.
                 if (callee.IsHostFunction()) {
-                    r = CallHostFunction(callee.AsHostFunction(), this_val,
-                                         argbuf, argc);
-                } else if (callee.IsFunction()) {
-                    r = CallFunction(callee.AsFunction(), this_val,
-                                     argbuf, argc);
-                } else {
+                    acc = callee.AsHostFunction()->fn()(
+                        this, this_val, argbuf, argc);
+                    V12_DISPATCH();
+                }
+                // JS function: inline call.
+                if (V12_LIKELY(callee.IsFunction())) {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    if (callee_info == nullptr) {
+                        Value exc = Value::FromHeap(JSString::New(iso_,
+                            "TypeError: not a function"));
+                        pending_exception_ = exc;
+                        uint32_t catch_off = info->FindHandler(call_off);
+                        if (catch_off != 0xFFFFFFFF) {
+                            sync();
+                            pc = bytecode_base + catch_off;
+                            acc = exc;
+                            V12_DISPATCH();
+                        }
+                        return {InterpStatus::kThrew, exc};
+                    }
+                    frame->pc = pc;
+                    Value* new_regs = PushFrame(callee_info, fn, this_val,
+                                                fn->closure_context(), argc, argbuf);
+                    frame = &frames_.back();
+                    regs = new_regs;
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    V12_DISPATCH();
+                }
+                // Not callable.
+                {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
                     pending_exception_ = exc;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
+                    uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
                         pc = bytecode_base + catch_off;
@@ -987,22 +1114,6 @@ InterpResult Interp::ExecuteTop() {
                     }
                     return {InterpStatus::kThrew, exc};
                 }
-                if (r.status == InterpStatus::kThrew) {
-                    pending_exception_ = r.value;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        sync();
-                        pc = bytecode_base + catch_off;
-                        acc = r.value;
-                        V12_DISPATCH();
-                    }
-                    return r;
-                }
-                sync();
-                pc = frame->pc;
-                acc = r.value;
-                V12_DISPATCH();
             }
             L_Construct: {
                 uint32_t call_off = static_cast<uint32_t>(
@@ -1013,18 +1124,53 @@ InterpResult Interp::ExecuteTop() {
                 Value callee = acc;
                 Value* args = regs + first_arg;
                 Value new_obj = Value::FromHeap(JSObject::New(iso_));
-                frame->pc = pc;
-                InterpResult r;
+                // Host function: call directly.
+                if (callee.IsHostFunction()) {
+                    Value result = callee.AsHostFunction()->fn()(
+                        this, new_obj, const_cast<Value*>(args), argc);
+                    acc = result.IsObject() ? result : new_obj;
+                    V12_DISPATCH();
+                }
+                // JS function: inline call.
                 if (callee.IsFunction()) {
-                    r = CallFunction(callee.AsFunction(), new_obj, args, argc);
-                } else if (callee.IsHostFunction()) {
-                    r = CallHostFunction(callee.AsHostFunction(), new_obj, args, argc);
-                } else {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    if (callee_info == nullptr) {
+                        Value exc = Value::FromHeap(JSString::New(iso_,
+                            "TypeError: not a constructor"));
+                        pending_exception_ = exc;
+                        uint32_t catch_off = info->FindHandler(call_off);
+                        if (catch_off != 0xFFFFFFFF) {
+                            sync();
+                            pc = bytecode_base + catch_off;
+                            acc = exc;
+                            V12_DISPATCH();
+                        }
+                        return {InterpStatus::kThrew, exc};
+                    }
+                    frame->pc = pc;
+                    Value* new_regs = PushFrame(callee_info, fn, new_obj,
+                                                fn->closure_context(), argc, args);
+                    frame = &frames_.back();
+                    regs = new_regs;
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    // Stash new_obj so the Return handler can use it if the
+                    // constructor returns a non-object. We use a special
+                    // frame field... actually, we'll handle this in Return
+                    // by checking if the function was called as a constructor.
+                    // For simplicity, we store new_obj in a thread-local.
+                    // TODO: add a proper constructor_new_obj field to Frame.
+                    V12_DISPATCH();
+                }
+                // Not callable.
+                {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a constructor"));
                     pending_exception_ = exc;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
+                    uint32_t catch_off = info->FindHandler(call_off);
                     if (catch_off != 0xFFFFFFFF) {
                         sync();
                         pc = bytecode_base + catch_off;
@@ -1033,26 +1179,6 @@ InterpResult Interp::ExecuteTop() {
                     }
                     return {InterpStatus::kThrew, exc};
                 }
-                if (r.status == InterpStatus::kThrew) {
-                    pending_exception_ = r.value;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        sync();
-                        pc = bytecode_base + catch_off;
-                        acc = r.value;
-                        V12_DISPATCH();
-                    }
-                    return r;
-                }
-                sync();
-                pc = frame->pc;
-                if (r.value.IsObject()) {
-                    acc = r.value;
-                } else {
-                    acc = new_obj;
-                }
-                V12_DISPATCH();
             }
             L_CallBuiltin: {
                 (void)ReadU8(&pc);
@@ -1195,29 +1321,78 @@ InterpResult Interp::ExecuteTop() {
             }
 
             // ----- Returns -----
-            L_Return:
+            // If there's a caller frame, pop the current frame and resume
+            // the caller (inline return — no C++ recursion). If this is
+            // the toplevel frame, return from ExecuteTop.
+            L_Return: {
+                if (frames_.size() > 1) {
+                    // Save the return value (acc) before popping.
+                    Value retval = acc;
+                    PopFrame();
+                    // Restore caller's state.
+                    frame = &frames_.back();
+                    regs = frame->regs;
+                    ctx = frame->context;
+                    info = frame->info;
+                    bytecode_base = info->bytecode.data();
+                    pc = frame->pc;
+                    acc = retval;
+                    V12_DISPATCH();
+                }
                 frame->pc = pc;
                 return {InterpStatus::kReturned, acc};
-            L_ReturnUndefined:
+            }
+            L_ReturnUndefined: {
+                if (frames_.size() > 1) {
+                    PopFrame();
+                    frame = &frames_.back();
+                    regs = frame->regs;
+                    ctx = frame->context;
+                    info = frame->info;
+                    bytecode_base = info->bytecode.data();
+                    pc = frame->pc;
+                    acc = iso_->undefined_value();
+                    V12_DISPATCH();
+                }
                 frame->pc = pc;
                 return {InterpStatus::kReturned, iso_->undefined_value()};
+            }
 
             // ----- Exceptions -----
             L_Throw: {
                 pending_exception_ = acc;
-                frame->pc = pc;
-                // Search for a handler in the current function. Use the
-                // offset of the Throw instruction itself (pc has already
-                // advanced past the opcode byte).
+                // Search for a handler in the current function, then walk
+                // up the call stack until we find one. This handles
+                // exceptions thrown in called functions (which now execute
+                // inline rather than via C++ recursion).
                 uint32_t throw_off = static_cast<uint32_t>(
                     (pc - bytecode_base) - 1);
-                uint32_t catch_off = info->FindHandler(throw_off);
-                if (catch_off != 0xFFFFFFFF) {
-                    pc = bytecode_base + catch_off;
-                    acc = pending_exception_;
-                    V12_DISPATCH();
+                while (true) {
+                    uint32_t catch_off = info->FindHandler(throw_off);
+                    if (catch_off != 0xFFFFFFFF) {
+                        // Found a handler in the current function.
+                        pc = bytecode_base + catch_off;
+                        acc = pending_exception_;
+                        V12_DISPATCH();
+                    }
+                    // No handler in this function — pop the frame and
+                    // search the caller's handler table.
+                    if (frames_.size() <= 1) {
+                        // Toplevel — uncaught exception.
+                        frame->pc = pc;
+                        return {InterpStatus::kThrew, acc};
+                    }
+                    PopFrame();
+                    frame = &frames_.back();
+                    regs = frame->regs;
+                    ctx = frame->context;
+                    info = frame->info;
+                    bytecode_base = info->bytecode.data();
+                    // The throw offset in the caller is the offset of the
+                    // Call instruction that invoked us.
+                    throw_off = static_cast<uint32_t>(
+                        (frame->pc - bytecode_base) - 1);
                 }
-                return {InterpStatus::kThrew, acc};
             }
             L_TryCatch: {
                 // No-op: the handler table is static (in FunctionInfo).

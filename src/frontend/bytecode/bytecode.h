@@ -65,7 +65,8 @@ enum class OperandKind : uint8_t {
 enum class Op : uint8_t {
     // Loading constants
     LdaConst,           // acc = constant[idx]
-    LdaSmi,             // acc = Smi(imm8)  - small int shortcut
+    LdaSmi,             // acc = Smi(imm8)  - small int shortcut (0..255)
+    LdaSmi16,           // acc = Smi(imm16) - medium int (-32768..32767)
     LdaZero,            // acc = 0
     LdaUndefined,       // acc = undefined
     LdaNull,            // acc = null
@@ -260,6 +261,30 @@ struct FunctionInfo {
         uint32_t column;
     };
     std::vector<SourcePosition> source_positions;
+
+    // ----- Inline cache (IC) storage -----
+    // Each feedback slot (the idx:16 operand on property access opcodes)
+    // maps to an ICEntry. The IC caches the (Shape, slot) pair from the
+    // last execution, so the fast path is a single shape-pointer compare
+    // + a single property-array load — no string comparison, no linear
+    // scan of the shape's property list.
+    struct ICEntry {
+        // The shape seen on the last execution. nullptr means "uninitialized".
+        // We use uintptr_t to avoid header dependencies (Shape is incomplete
+        // in this file). The interpreter casts to Shape* as needed.
+        uintptr_t shape = 0;
+        // The property slot index for this shape.
+        uint16_t slot = 0xFFFF;
+        // Is this IC entry initialized?
+        bool initialized = false;
+    };
+    std::vector<ICEntry> ic_entries;
+
+    // Get the IC entry for a feedback slot index. Grows the vector as needed.
+    ICEntry& GetIC(uint16_t idx) {
+        if (idx >= ic_entries.size()) ic_entries.resize(idx + 1);
+        return ic_entries[idx];
+    }
 
     // ----- Exception handler table -----
     // Maps a bytecode range (the try block) to a catch handler offset.

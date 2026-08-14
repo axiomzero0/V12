@@ -736,17 +736,19 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
     switch (e->kind) {
         case AstKind::kNumberLiteral: {
             NumberLiteral* n = static_cast<NumberLiteral*>(e);
-            // Smi shortcut: if the value is an integer in Smi range, use LdaSmi.
+            // Smi shortcut: if the value is an integer in Smi range, use LdaSmi/LdaSmi16.
             if (n->value == static_cast<double>(static_cast<intptr_t>(n->value)) &&
                 n->value >= -1e18 && n->value <= 1e18) {
                 intptr_t v = static_cast<intptr_t>(n->value);
-                if (v >= 0 && v <= 127) {
-                    if (v == 0) {
-                        EmitOp(fs, Op::LdaZero);
-                    } else {
-                        EmitOp(fs, Op::LdaSmi);
-                        EmitImm8(fs, static_cast<uint8_t>(v));
-                    }
+                if (v == 0) {
+                    EmitOp(fs, Op::LdaZero);
+                } else if (v >= 0 && v <= 127) {
+                    EmitOp(fs, Op::LdaSmi);
+                    EmitImm8(fs, static_cast<uint8_t>(v));
+                } else if (v >= -32768 && v <= 32767) {
+                    // Fits in int16 — use LdaSmi16 (3 bytes vs 5 for LdaConst).
+                    EmitOp(fs, Op::LdaSmi16);
+                    EmitImm16(fs, static_cast<uint16_t>(static_cast<int16_t>(v)));
                 } else {
                     uint32_t idx = AddConstSmi(fs, v);
                     EmitOp(fs, Op::LdaConst);
