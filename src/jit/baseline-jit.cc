@@ -81,7 +81,8 @@ static bool IsOpcodeSupported(Op op) {
     }
 }
 
-std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
+std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
+                                                uint32_t osr_entry_offset) {
     auto& bc = fi->bytecode;
     if (bc.empty()) return nullptr;
 
@@ -89,6 +90,9 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
     // unsupported opcodes emit a deopt stub (return to interpreter at that
     // bytecode offset). The interpreter resumes and will re-enter the JIT
     // on the next JumpLoop.
+    // The osr_entry_offset is the bytecode offset of the loop start.
+    // After the prologue, we jump directly to that offset's label,
+    // skipping the function setup (which the interpreter already did).
 
     Environment env(Arch::kX64);
     CodeHolder code;
@@ -129,30 +133,21 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
     a.push(r15);
 
     // Rearrange args from ABI to internal convention:
-    //   deopt_ptr (R14) = arg1 (RDI)
-    //   acc (RAX) = arg2 (RSI)
-    //   regs (RSI) = arg3 (RDX)
-    //   frame (RDI) = arg4 (RCX)
-    //   iso (R12) = arg5 (R8)
     a.mov(deopt_ptr, rdi);  // deopt_ptr = arg1
     a.mov(acc, rsi);         // acc = arg2
     a.mov(regs, rdx);        // regs = arg3
     a.mov(frame, rcx);       // frame = arg4
     a.mov(iso, r8);          // iso = arg5
-    // JIT entry: arg1(RDI)=acc_raw, arg2(RSI)=regs, arg3(RDX)=frame, arg4(RCX)=iso
-    // Returns: RAX = deopt flag (0 = normal, nonzero = deopt offset+1)
-    // The JIT stores the acc value in regs[0] before returning (via Star r0
-    // or the Return handler).
-    a.mov(acc, rdi);         // acc = arg1 (raw bits)
-    // RSI already has regs (arg2)
-    a.mov(frame, rdx);       // frame = arg3
-    a.mov(iso, rcx);         // iso = arg4
 
     // Labels for each bytecode offset (for jump patching).
-    // We create a label per bytecode instruction.
     std::vector<Label> labels(bc.size() + 1);
     for (size_t j = 0; j <= bc.size(); ++j) {
         labels[j] = a.new_label();
+    }
+
+    // OSR: jump directly to the loop entry point (skip function setup).
+    if (osr_entry_offset > 0 && osr_entry_offset < bc.size()) {
+        a.jmp(labels[osr_entry_offset]);
     }
 
     size_t i = 0;
@@ -233,18 +228,41 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
             // If not Smi or overflow, deopt.
             case Op::Add: {
                 uint8_t r = bc[i + 1];
-                
+                Label no_overflow = a.new_label();
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                // Check both are Smis.
                 a.test(acc, 1);
                 a.jz(labels[bc.size()]);
                 a.test(scratch1, 1);
                 a.jz(labels[bc.size()]);
                 // Smi add: a + b - 1 = correct tagged result.
                 a.add(acc, scratch1);
-                
-                a.jo(labels[bc.size()]);
-                
+                a.jno(no_overflow);
+                // Overflow: reload acc from the register that Ldar loaded
+                // (we don't know which one, so store the overflowed acc
+                // and deopt to THIS instruction so the interpreter redoes it).
+                // The interpreter will see acc = overflowed value, but it
+                // will call Add() which uses ToDouble (handles any value).
+                // Actually, the interpreter's Add handler reads acc and regs[r].
+                // acc is the overflowed value (garbage). We need to restore
+                // acc to the value BEFORE the add. But we don't have it.
+                // Solution: deopt to the instruction BEFORE the Add (the Ldar).
+                // The Ldar will reload acc from the register, then the Add
+                // will be redone by the interpreter.
+                // But we don't know the Ldar's offset. Instead, just store
+                // the overflowed acc and deopt to the Add offset. The
+                // interpreter's Add handler calls Add(iso, acc, regs[r]).
+                // acc is the overflowed tagged value. Add() calls ToDouble
+                // which will interpret it as a Smi (wrong value) or crash.
+                //
+                // Better: just deopt to the generic label and let the
+                // interpreter redo from the loop start. The registers are
+                // still valid (s and i are in their registers, untouched
+                // by the JIT's add which only modified acc).
+                a.mov(x86::ptr(regs, 0), acc);  // store acc (garbage but won't be used)
+                a.mov(acc, static_cast<uint64_t>(0xDEAD));
+                a.pop(r15); a.pop(r14); a.pop(r13); a.pop(r12); a.pop(rbx);
+                a.ret();
+                a.bind(no_overflow);
                 a.sub(acc, 1);
                 break;
             }

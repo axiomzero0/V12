@@ -33,7 +33,10 @@ class Interp;
 class BaselineJIT {
 public:
     // Compile a FunctionInfo into a CodeObject. Returns nullptr on failure.
-    static std::unique_ptr<CodeObject> Compile(FunctionInfo* fi);
+    // The `osr_entry_offset` is the bytecode offset of the loop start —
+    // the JIT entry point jumps directly there instead of offset 0.
+    static std::unique_ptr<CodeObject> Compile(FunctionInfo* fi,
+                                                uint32_t osr_entry_offset = 0);
 
     // OSR threshold: number of JumpLoop iterations before tier-up.
     static constexpr uint32_t kOSRThreshold = 500;

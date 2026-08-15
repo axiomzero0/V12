@@ -682,21 +682,18 @@ InterpResult Interp::ExecuteTop() {
             }
             L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
-                // OSR: increment hotness counter. When it crosses a threshold,
-                // compile the function with the baseline JIT and execute it.
                 info->hotness_counter++;
 #ifndef V12_NO_JIT
                 if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
                                  info->jit_code == 0)) {
-                    auto co = BaselineJIT::Compile(info);
+                    // Compile with OSR entry at the loop start.
+                    auto co = BaselineJIT::Compile(info, target);
                     if (co) {
                         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                     }
                 }
-                // If JIT code is available and we haven't deopted too many
-                // times, execute it. After 3 deopts, give up on JIT for
-                // this function.
-                if (false && V12_UNLIKELY(info->jit_code != 0 &&
+                // Execute JIT if available and not too many deopts.
+                if (V12_UNLIKELY(info->jit_code != 0 &&
                                  info->deopt_count < 3)) {
                     auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
                     // Simplified protocol: JIT returns a raw uintptr_t in RAX.
@@ -708,7 +705,7 @@ InterpResult Interp::ExecuteTop() {
                     uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
                     if (ret != 0) {
                         // Deopt: increment counter and resume interpreter.
-                        info->deopt_count++;
+                        info->deopt_count = 100; // give up on JIT after first deopt
                         uint32_t resume_pc = (ret == 0xDEAD || ret == 0xCAFE)
                             ? target
                             : static_cast<uint32_t>(ret - 1);
