@@ -48,6 +48,7 @@
 
 #include "base/macros.h"
 #include "frontend/bytecode/bytecode.h"
+#include "vm/isolate/isolate.h"
 #include "vm/objects/context.h"
 #include "vm/values/value.h"
 
@@ -124,10 +125,12 @@ private:
     size_t reg_stack_top_ = 0;
     static constexpr size_t kRegRegionSize = 256 * 1024 * 1024;  // 256 MB
 
-    // The frame stack. Grows dynamically via std::vector. After each Call,
-    // we re-fetch the frame pointer from frames_.back() — this is a single
-    // load and is always correct regardless of realloc.
-    std::vector<Frame> frames_;
+    // The frame stack. We use a raw array + top pointer instead of
+    // std::vector to eliminate push_back/pop_back overhead (capacity
+    // checks, size updates, back() dereferences). Pre-allocated to
+    // max_depth_ entries.
+    Frame* frames_ = nullptr;
+    size_t frame_top_ = 0;  // index of next free slot (= current depth)
 
     // Pending exception (set by Throw, cleared by TryCatch).
     Value pending_exception_;
@@ -140,17 +143,42 @@ private:
     // into the dispatch loop.
     [[gnu::hot, gnu::flatten]] InterpResult ExecuteTop();
 
-    // Push a new frame for `fn` with `argc` arguments. Returns a pointer
-    // to the new frame's register file. The caller fills registers 0..argc-1
-    // with the arguments before calling ExecuteTop.
-    Value* PushFrame(FunctionInfo* info, JSFunction* fn, Value this_val,
-                     Context* closure_ctx, uint32_t argc, const Value* args);
+    // Push a new frame — ALWAYS_INLINE for the hot call path.
+    [[gnu::always_inline]] Value* PushFrame(FunctionInfo* info, JSFunction* fn,
+                     Value this_val, Context* closure_ctx,
+                     uint32_t argc, const Value* args) {
+        V12_CHECK(frame_top_ < max_depth_, "maximum call stack depth exceeded");
+        uint16_t nregs = info->num_registers;
+        if (nregs == 0) nregs = 1;
+        size_t base = reg_stack_top_;
+        reg_stack_top_ += nregs;
+        Frame* f = &frames_[frame_top_++];
+        f->info = info;
+        f->regs = reg_base_ + base;
+        f->pc = info->bytecode.data();
+        f->context = closure_ctx;
+        f->this_val = this_val;
+        f->function = fn;
+        uint16_t nparams = info->num_parameters;
+        uint16_t to_copy = (argc < nparams) ? static_cast<uint16_t>(argc) : nparams;
+        Value* r = f->regs;
+        for (uint16_t i = 0; i < to_copy; ++i) r[i] = args[i];
+        Value undef = iso_->undefined_value();
+        for (uint16_t i = to_copy; i < nparams; ++i) r[i] = undef;
+        return r;
+    }
 
-    // Pop the top frame.
-    void PopFrame();
+    // Pop the top frame — ALWAYS_INLINE for the hot return path.
+    [[gnu::always_inline]] void PopFrame() {
+        --frame_top_;
+        Frame* f = &frames_[frame_top_];
+        uint16_t nregs = f->info->num_registers;
+        if (nregs == 0) nregs = 1;
+        reg_stack_top_ -= nregs;
+    }
 
     // Access the top frame.
-    Frame* TopFrame() { return &frames_.back(); }
+    Frame* TopFrame() { return &frames_[frame_top_ - 1]; }
 
     // Read an operand at the current PC, advancing PC.
     // These use memcpy for multi-byte reads, which the compiler optimizes
