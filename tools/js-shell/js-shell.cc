@@ -25,6 +25,7 @@
 #include "tools/js-shell/builtins.h"
 #include "vm/isolate/isolate.h"
 #include "vm/objects/object.h"
+#include "vm/objects/primitives.h"
 #include "vm/runtime/runtime.h"
 
 int main(int argc, char** argv) {
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
     if (r.status == v12::InterpStatus::kThrew) {
         v12::Value s = v12::ToString(&iso, r.value);
         if (s.IsString()) {
-            auto* js = static_cast<v12::JSString*>(s.AsHeapObject());
+            auto* js = v12::FlattenString(&iso, s);
             std::fprintf(stderr, "Uncaught: %.*s\n",
                          static_cast<int>(js->length()), js->data());
         }

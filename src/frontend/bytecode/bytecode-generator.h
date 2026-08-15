@@ -53,6 +53,14 @@ public:
     // allocated program (owned by the caller via unique_ptr).
     std::unique_ptr<BytecodeProgram> Compile(Program* prog);
 
+    // Lazily compile a function that was deferred during initial compilation.
+    // Called by the interpreter on first CreateClosure for a function with
+    // is_compiled == false. Compiles the bytecode into the existing
+    // FunctionInfo (in place).
+    // The program must be the BytecodeProgram that owns fi and scope_analyzer.
+    void CompileLazyFunction(FunctionInfo* fi, BytecodeProgram* program,
+                            ScopeAnalyzer* scope_analyzer);
+
 private:
     // ----- Per-function emission state -----
     struct FnState {
@@ -84,6 +92,8 @@ private:
     //   - LdaUndefined; Return → ReturnUndefined
     // Returns the number of instructions removed.
     size_t PeepholeOptimize(FunctionInfo* fi);
+
+private:
 
     // Compile a function body. Returns the FunctionInfo.
     FunctionInfo* CompileFunction(FnState* parent_fs,
@@ -141,8 +151,19 @@ private:
 
     Isolate* iso_;
     Arena* arena_;
-    std::unique_ptr<BytecodeProgram> program_;
-    std::unique_ptr<ScopeAnalyzer> scope_analyzer_;
+    // The program being compiled. In Compile(), we create a new one and
+    // transfer ownership to the caller. In CompileLazyFunction, we borrow
+    // the existing program (non-owning).
+    // IMPORTANT: program_owned_ must be declared BEFORE program_raw_
+    // because program_raw_ is initialized from program_owned_.get() in
+    // the constructor's initializer list, and C++ initializes members in
+    // declaration order.
+    std::unique_ptr<BytecodeProgram> program_owned_;
+    BytecodeProgram* program_raw_ = nullptr;
+    // The scope analyzer. Owned by Compile() (created via unique_ptr).
+    // For lazy compilation, borrowed from the BytecodeProgram.
+    std::unique_ptr<ScopeAnalyzer> scope_analyzer_owned_;
+    ScopeAnalyzer* scope_analyzer_raw_ = nullptr;
 };
 
 }  // namespace v12

@@ -4,11 +4,18 @@
 
 #include "frontend/bytecode/bytecode.h"
 
+#include "frontend/bytecode/scope.h"
 #include "vm/isolate/isolate.h"
 #include "vm/objects/object.h"
 #include "vm/objects/primitives.h"
 
 namespace v12 {
+
+// BytecodeProgram constructor/destructor — defined here (not in the header)
+// because the unique_ptr<ScopeAnalyzer> destructor needs ScopeAnalyzer's
+// complete definition (which is in scope.h).
+BytecodeProgram::BytecodeProgram() = default;
+BytecodeProgram::~BytecodeProgram() = default;
 
 const char* OpName(Op op) {
     return GetOpInfo(op).name;

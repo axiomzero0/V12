@@ -674,6 +674,11 @@ InterpResult Interp::ExecuteTop() {
             }
             L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
+                // OSR: increment hotness counter. When it crosses a threshold,
+                // kick off baseline JIT compilation. For now, we just count —
+                // the actual JIT compilation and tier-up will be wired in
+                // once the baseline JIT supports enough opcodes.
+                info->hotness_counter++;
                 pc = bytecode_base + target;
                 V12_DISPATCH();
             }
@@ -1262,6 +1267,13 @@ InterpResult Interp::ExecuteTop() {
                 const Constant& c = info->constants[cidx];
                 V12_DCHECK(c.kind == Constant::Kind::kFunctionInfo, "not a function constant");
                 FunctionInfo* inner_info = current_program_->functions[c.index].get();
+                // Lazy compilation: if the function hasn't been compiled yet,
+                // compile it now (on first use).
+                if (V12_UNLIKELY(!inner_info->is_compiled)) {
+                    BytecodeGenerator gen(iso_, nullptr);
+                    gen.CompileLazyFunction(inner_info, current_program_,
+                                           current_program_->scope_analyzer.get());
+                }
                 acc = Value::FromHeap(JSFunction::New(iso_, inner_info, ctx));
                 V12_DISPATCH();
             }

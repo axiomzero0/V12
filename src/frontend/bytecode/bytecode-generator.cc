@@ -29,24 +29,32 @@ namespace v12 {
 
 BytecodeGenerator::BytecodeGenerator(Isolate* iso, Arena* arena)
     : iso_(iso), arena_(arena),
-      program_(std::make_unique<BytecodeProgram>()),
-      scope_analyzer_(std::make_unique<ScopeAnalyzer>(arena, iso, nullptr)) {}
+      program_owned_(std::make_unique<BytecodeProgram>()),
+      program_raw_(program_owned_.get()) {
+}
 
 BytecodeGenerator::~BytecodeGenerator() = default;
 
 std::unique_ptr<BytecodeProgram> BytecodeGenerator::Compile(Program* prog) {
+    // If program_owned_ was released by a previous CompileLazyFunction call,
+    // recreate it.
+    if (!program_owned_) {
+        program_owned_ = std::make_unique<BytecodeProgram>();
+        program_raw_ = program_owned_.get();
+    }
     // Re-create the scope analyzer with the actual program.
-    scope_analyzer_ = std::make_unique<ScopeAnalyzer>(arena_, iso_, prog);
-    scope_analyzer_->Analyze();
+    scope_analyzer_owned_ = std::make_unique<ScopeAnalyzer>(arena_, iso_, prog);
+    scope_analyzer_raw_ = scope_analyzer_owned_.get();
+    scope_analyzer_raw_->Analyze();
 
     // Compile the top-level program as a FunctionInfo with no parameters.
     FnState top_fs;
-    top_fs.info = program_->NewFunction("<toplevel>");
+    top_fs.info = program_raw_->NewFunction("<toplevel>");
     top_fs.info->is_toplevel = true;
-    top_fs.scope = scope_analyzer_->global_scope();
+    top_fs.scope = scope_analyzer_raw_->global_scope();
     // The global scope has no local variables (all globals), so next_local()
     // is 0. Start temps at 0.
-    top_fs.next_temp = scope_analyzer_->global_scope()->next_local();
+    top_fs.next_temp = scope_analyzer_raw_->global_scope()->next_local();
 
     // Compile each top-level statement.
     for (Stmt* s : prog->body) {
@@ -62,14 +70,104 @@ std::unique_ptr<BytecodeProgram> BytecodeGenerator::Compile(Program* prog) {
     // Count context vars (the top-level doesn't allocate a context).
     top_fs.info->num_context_vars = 0;
 
-    program_->toplevel = top_fs.info;
+    program_raw_->toplevel = top_fs.info;
 
     // Run peephole optimization on all functions.
-    for (auto& fi : program_->functions) {
-        PeepholeOptimize(fi.get());
+    for (auto& fi : program_raw_->functions) {
+        if (fi->is_compiled) {
+            PeepholeOptimize(fi.get());
+        }
     }
 
-    return std::move(program_);
+    // Move the scope analyzer into the program so that lazy compilation
+    // can use it later.
+    program_raw_->scope_analyzer = std::move(scope_analyzer_owned_);
+    scope_analyzer_raw_ = nullptr;
+
+    // Transfer program ownership to the caller.
+    program_raw_ = nullptr;
+    return std::move(program_owned_);
+}
+
+void BytecodeGenerator::CompileLazyFunction(FunctionInfo* fi, BytecodeProgram* program,
+                                            ScopeAnalyzer* sa) {
+    if (fi->is_compiled) return;
+
+    // Borrow the program and scope analyzer (both owned by the caller).
+    scope_analyzer_raw_ = sa;
+    program_raw_ = program;
+    program_owned_.reset();  // Release our own empty program.
+
+    Scope* fn_scope = static_cast<Scope*>(fi->lazy_scope);
+
+    // Determine which AST kind we have.
+    void* ast = fi->lazy_ast;
+    AstNode* node = static_cast<AstNode*>(ast);
+
+    SmallVector<Parameter, 4> params;
+    Stmt* body = nullptr;
+    Expr* expr_body = nullptr;
+
+    if (node->kind == AstKind::kFunctionDecl) {
+        FunctionDecl* fd = static_cast<FunctionDecl*>(node);
+        params = fd->params;
+        body = fd->body;
+    } else if (node->kind == AstKind::kFunctionExpr) {
+        FunctionExpr* fn = static_cast<FunctionExpr*>(node);
+        params = fn->params;
+        body = fn->body;
+    } else if (node->kind == AstKind::kArrowFunction) {
+        ArrowFunction* af = static_cast<ArrowFunction*>(node);
+        params = af->params;
+        body = af->block_body;
+        expr_body = af->expr_body;
+    } else {
+        V12_CHECK(false, "unknown lazy AST kind");
+    }
+
+    // Compile the function body in place (into the existing FunctionInfo).
+    // We temporarily set fi->is_compiled = true so CompileFunction doesn't
+    // recurse into lazy compilation.
+    fi->is_compiled = true;
+
+    // Create a FnState and compile.
+    FnState fs;
+    fs.info = fi;
+    fs.scope = fn_scope;
+    fs.next_temp = fn_scope->next_local();
+
+    fi->num_context_vars = fn_scope->num_context_vars();
+
+    if (fi->num_context_vars > 0) {
+        EmitOp(&fs, Op::CreateContext);
+        EmitImm16(&fs, fi->num_context_vars);
+        EmitIdx(&fs, AllocFeedbackSlot(&fs));
+        EmitOp(&fs, Op::PushContext);
+        EmitIdx(&fs, AllocFeedbackSlot(&fs));
+        for (auto& b : fn_scope->bindings()) {
+            if (b.is_captured && b.reg < static_cast<uint8_t>(params.size())) {
+                EmitOp(&fs, Op::Ldar);
+                EmitReg(&fs, b.reg);
+                EmitOp(&fs, Op::StoreContext);
+                EmitReg(&fs, 0);
+                EmitImm16(&fs, 0);
+                EmitImm16(&fs, b.context_index);
+                EmitIdx(&fs, AllocFeedbackSlot(&fs));
+            }
+        }
+    }
+
+    if (body) {
+        EmitStmt(&fs, body);
+    } else if (expr_body) {
+        EmitExpr(&fs, expr_body);
+    }
+    EmitOp(&fs, Op::ReturnUndefined);
+
+    fi->num_registers = fs.next_temp > 0 ? fs.next_temp : 1;
+
+    // Run peephole optimization on the newly compiled function.
+    PeepholeOptimize(fi);
 }
 
 // -----------------------------------------------------------------------------
@@ -218,9 +316,9 @@ uint32_t BytecodeGenerator::AddConstString(FnState* fs, std::string_view s) {
     return static_cast<uint32_t>(fs->info->constants.size() - 1);
 }
 uint32_t BytecodeGenerator::AddConstFunctionInfo(FnState* fs, FunctionInfo* fi) {
-    // Find the index of fi in program_->functions.
+    // Find the index of fi in program_raw_->functions.
     uint32_t idx = 0;
-    for (auto& up : program_->functions) {
+    for (auto& up : program_raw_->functions) {
         if (up.get() == fi) {
             Constant c;
             c.kind = Constant::Kind::kFunctionInfo;
@@ -257,7 +355,7 @@ uint16_t BytecodeGenerator::AddGlobalName(FnState* fs, std::string_view s) {
 // Identifier load/store
 // -----------------------------------------------------------------------------
 void BytecodeGenerator::EmitLoadIdentifier(FnState* fs, Identifier* id) {
-    ResolvedVar r = scope_analyzer_->Resolve(id->name, fs->scope);
+    ResolvedVar r = scope_analyzer_raw_->Resolve(id->name, fs->scope);
     switch (r.location) {
         case VarLocation::kLocal:
             EmitOp(fs, Op::Ldar);
@@ -284,7 +382,7 @@ void BytecodeGenerator::EmitLoadIdentifier(FnState* fs, Identifier* id) {
 }
 
 void BytecodeGenerator::EmitStoreIdentifier(FnState* fs, Identifier* id) {
-    ResolvedVar r = scope_analyzer_->Resolve(id->name, fs->scope);
+    ResolvedVar r = scope_analyzer_raw_->Resolve(id->name, fs->scope);
     switch (r.location) {
         case VarLocation::kLocal:
             EmitOp(fs, Op::Star);
@@ -318,7 +416,7 @@ FunctionInfo* BytecodeGenerator::CompileFunction(FnState* parent_fs,
                                                    Expr* expr_body,
                                                    bool is_toplevel) {
     (void)parent_fs;
-    FunctionInfo* fi = program_->NewFunction(std::string(name));
+    FunctionInfo* fi = program_raw_->NewFunction(std::string(name));
     FnState fs;
     fs.info = fi;
     fs.scope = fn_scope;
@@ -394,7 +492,7 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
     // switch to it for the duration of this statement. This matters for
     // blocks, for-loops, catch clauses, etc. — they introduce a new
     // scope for let/const declarations.
-    Scope* node_scope = scope_analyzer_->GetScope(s);
+    Scope* node_scope = scope_analyzer_raw_->GetScope(s);
     Scope* saved_scope = nullptr;
     if (node_scope != nullptr && node_scope != fs->scope) {
         saved_scope = fs->scope;
@@ -419,10 +517,14 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
         }
         case AstKind::kFunctionDecl: {
             FunctionDecl* fd = static_cast<FunctionDecl*>(s);
-            // Compile the function body.
-            Scope* fn_scope = scope_analyzer_->GetScope(fd);
-            FunctionInfo* inner = CompileFunction(fs, fn_scope, fd->name,
-                                                   fd->params, fd->body, nullptr, false);
+            // Create a lazy FunctionInfo — don't compile the body yet.
+            // The body will be compiled on first CreateClosure.
+            Scope* fn_scope = scope_analyzer_raw_->GetScope(fd);
+            FunctionInfo* inner = program_raw_->NewFunction(std::string(fd->name));
+            inner->is_compiled = false;
+            inner->lazy_ast = fd;
+            inner->lazy_scope = fn_scope;
+            inner->num_parameters = static_cast<uint16_t>(fd->params.size());
             // CreateClosure: acc = closure of function_info[idx]
             uint32_t cidx = AddConstFunctionInfo(fs, inner);
             EmitOp(fs, Op::CreateClosure);
@@ -519,7 +621,7 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
                     // instead of Ldar+Inc+Star (three instructions).
                     if (u->operand->kind == AstKind::kIdentifier) {
                         Identifier* id = static_cast<Identifier*>(u->operand);
-                        ResolvedVar rv = scope_analyzer_->Resolve(id->name, fs->scope);
+                        ResolvedVar rv = scope_analyzer_raw_->Resolve(id->name, fs->scope);
                         if (rv.location == VarLocation::kLocal) {
                             EmitOp(fs, u->op_token == static_cast<int>(TokenKind::kInc)
                                        ? Op::IncReg : Op::DecReg);
@@ -611,7 +713,7 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
                 // Switch to the catch body's scope BEFORE binding the
                 // exception variable, so that EmitStoreIdentifier resolves
                 // `e` in the catch scope (not the enclosing scope).
-                Scope* catch_scope = scope_analyzer_->GetScope(t->catch_clause->body);
+                Scope* catch_scope = scope_analyzer_raw_->GetScope(t->catch_clause->body);
                 Scope* saved = nullptr;
                 if (catch_scope != nullptr && catch_scope != fs->scope) {
                     saved = fs->scope;
@@ -1279,10 +1381,12 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
         }
         case AstKind::kFunctionExpr: {
             FunctionExpr* fn = static_cast<FunctionExpr*>(e);
-            Scope* fn_scope = scope_analyzer_->GetScope(fn);
-            std::string_view name = fn->name;
-            FunctionInfo* inner = CompileFunction(fs, fn_scope, name,
-                                                   fn->params, fn->body, nullptr, false);
+            Scope* fn_scope = scope_analyzer_raw_->GetScope(fn);
+            FunctionInfo* inner = program_raw_->NewFunction(std::string(fn->name));
+            inner->is_compiled = false;
+            inner->lazy_ast = fn;
+            inner->lazy_scope = fn_scope;
+            inner->num_parameters = static_cast<uint16_t>(fn->params.size());
             uint32_t cidx = AddConstFunctionInfo(fs, inner);
             EmitOp(fs, Op::CreateClosure);
             EmitImm32(fs, cidx);
@@ -1290,10 +1394,12 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
         }
         case AstKind::kArrowFunction: {
             ArrowFunction* af = static_cast<ArrowFunction*>(e);
-            Scope* fn_scope = scope_analyzer_->GetScope(af);
-            FunctionInfo* inner = CompileFunction(fs, fn_scope, "<arrow>",
-                                                   af->params, af->block_body, af->expr_body,
-                                                   false);
+            Scope* fn_scope = scope_analyzer_raw_->GetScope(af);
+            FunctionInfo* inner = program_raw_->NewFunction("<arrow>");
+            inner->is_compiled = false;
+            inner->lazy_ast = af;
+            inner->lazy_scope = fn_scope;
+            inner->num_parameters = static_cast<uint16_t>(af->params.size());
             uint32_t cidx = AddConstFunctionInfo(fs, inner);
             EmitOp(fs, Op::CreateClosure);
             EmitImm32(fs, cidx);

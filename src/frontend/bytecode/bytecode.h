@@ -316,6 +316,28 @@ struct FunctionInfo {
     // Look up a constant's Value at runtime. Returns the appropriate Value
     // (Smi, HeapNumber, JSString, etc.) given an Isolate.
     Value ResolveConstant(Isolate* iso, uint32_t idx) const;
+
+    // ----- Lazy compilation -----
+    // If false, this function's bytecode has not been compiled yet. The
+    // interpreter triggers compilation on first CreateClosure.
+    bool is_compiled = true;
+
+    // Tier-up counter for OSR. Incremented on JumpLoop; when it crosses
+    // a threshold, the interpreter triggers baseline JIT compilation.
+    uint32_t hotness_counter = 0;
+
+    // Pointer to the baseline JIT CodeObject (if compiled). nullptr means
+    // no JIT code has been generated yet.
+    class CodeObject;
+    CodeObject* jit_code = nullptr;
+
+    // For lazy compilation: stores the AST node and scope needed to
+    // compile this function on first use. Only set when is_compiled == false.
+    // The AST node is either a FunctionDecl*, FunctionExpr*, or ArrowFunction*.
+    // We store it as void* to avoid header dependencies.
+    void* lazy_ast = nullptr;       // FunctionDecl* / FunctionExpr* / ArrowFunction*
+    void* lazy_scope = nullptr;     // Scope*
+    bool lazy_is_toplevel = false;
 };
 
 // BytecodeProgram: the result of compiling a whole source file. Owns:
@@ -325,6 +347,14 @@ struct FunctionInfo {
 struct BytecodeProgram {
     std::vector<std::unique_ptr<FunctionInfo>> functions;
     FunctionInfo* toplevel = nullptr;
+    // The scope analyzer is kept alive here so that lazy compilation can
+    // use it (it contains the scope tree built during the initial Compile).
+    // Forward-declared to avoid header dependency. The destructor is defined
+    // in bytecode.cc where ScopeAnalyzer is complete.
+    std::unique_ptr<class ScopeAnalyzer> scope_analyzer;
+
+    BytecodeProgram();
+    ~BytecodeProgram();
 
     FunctionInfo* NewFunction(std::string name) {
         auto fi = std::make_unique<FunctionInfo>();
