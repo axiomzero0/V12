@@ -47,7 +47,9 @@ namespace v12 {
 // Global deopt flag. JIT code writes to this when it needs to deopt.
 // 0 = no deopt, nonzero = deopt at bytecode offset (flag-1).
 // 0xDEAD = generic deopt (resume from JumpLoop target).
-uintptr_t g_jit_deopt_flag = 0;
+// Marked volatile so the compiler doesn't cache the value across the
+// JIT call (the JIT modifies it through a pointer).
+volatile uintptr_t g_jit_deopt_flag = 0;
 
 // -----------------------------------------------------------------------------
 // Construction / destruction
@@ -693,23 +695,24 @@ InterpResult Interp::ExecuteTop() {
                 // If JIT code is available, execute it.
                 if (V12_UNLIKELY(info->jit_code != 0)) {
                     auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
-                    // JIT entry: (RAX=acc, RSI=regs, RDI=frame, R12=iso)
-                    // Returns: RAX = acc value
-                    // Deopt flag is in a global variable.
-                    typedef Value (*JitEntry)(Value acc, Value* regs, void* frame,
-                                             Isolate* iso, uintptr_t* deopt_flag);
+                    // Simplified protocol: JIT returns a raw uintptr_t in RAX.
+                    // 0 = normal return, nonzero = deopt at offset (val-1).
+                    // The JIT stores the acc value in regs[0] before returning.
+                    typedef uintptr_t (*JitEntry)(uintptr_t acc, Value* regs,
+                                                 void* frame, Isolate* iso);
                     auto entry = reinterpret_cast<JitEntry>(co->entry_point());
-                    g_jit_deopt_flag = 0;
-                    Value result = entry(acc, regs, frame, iso_, &g_jit_deopt_flag);
-                    if (g_jit_deopt_flag != 0) {
-                        uint32_t resume_pc = (g_jit_deopt_flag == 0xDEAD)
+                    uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
+                    if (ret != 0) {
+                        // Deopt.
+                        uint32_t resume_pc = (ret == 0xDEAD || ret == 0xCAFE)
                             ? target
-                            : static_cast<uint32_t>(g_jit_deopt_flag - 1);
+                            : static_cast<uint32_t>(ret - 1);
                         pc = bytecode_base + resume_pc;
-                        acc = result;
+                        acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
                         V12_DISPATCH();
                     }
-                    acc = result;
+                    // Normal return.
+                    acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
                     if (frames_.size() > 1) {
                         PopFrame();
                         frame = &frames_.back();

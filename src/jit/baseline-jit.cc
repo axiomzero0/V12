@@ -36,6 +36,9 @@ namespace v12 {
 
 using namespace asmjit;
 
+// External declaration of the interpreter's deopt flag (defined in interpreter.cc).
+extern volatile uintptr_t g_jit_deopt_flag;
+
 // Smi tag constants (must match TaggedValue).
 static constexpr uint64_t kSmiTag = 1;
 static constexpr uint64_t kSmiShift = 1;
@@ -103,11 +106,11 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
     //   rcx, rdx = scratch
     //
     // The JIT entry point follows System V AMD64 ABI:
-    //   arg1 (RDI) = acc (Value, 8 bytes)
-    //   arg2 (RSI) = regs (Value*)
-    //   arg3 (RDX) = frame (void*)
-    //   arg4 (RCX) = iso (Isolate*)
-    //   arg5 (R8)  = deopt_flag (uintptr_t*)
+    //   arg1 (RDI) = deopt_flag (uintptr_t*)
+    //   arg2 (RSI) = acc (uintptr_t, raw bits)
+    //   arg3 (RDX) = regs (Value*)
+    //   arg4 (RCX) = frame (void*)
+    //   arg5 (R8)  = iso (Isolate*)
     //
     // We rearrange to our internal convention in the prologue.
     const x86::Gp acc = rax;
@@ -126,22 +129,24 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
     a.push(r15);
 
     // Rearrange args from ABI to internal convention:
-    //   acc (RAX) = arg1 (RDI)
-    //   regs (RSI) = arg2 (RSI) — already correct
-    //   frame (RDI) = arg3 (RDX) — need to swap RDI and RDX
-    //   iso (R12) = arg4 (RCX)
-    //   deopt_ptr (R14) = arg5 (R8)
-    a.mov(acc, rdi);       // acc = arg1
+    //   deopt_ptr (R14) = arg1 (RDI)
+    //   acc (RAX) = arg2 (RSI)
+    //   regs (RSI) = arg3 (RDX)
+    //   frame (RDI) = arg4 (RCX)
+    //   iso (R12) = arg5 (R8)
+    a.mov(deopt_ptr, rdi);  // deopt_ptr = arg1
+    a.mov(acc, rsi);         // acc = arg2
+    a.mov(regs, rdx);        // regs = arg3
+    a.mov(frame, rcx);       // frame = arg4
+    a.mov(iso, r8);          // iso = arg5
+    // JIT entry: arg1(RDI)=acc_raw, arg2(RSI)=regs, arg3(RDX)=frame, arg4(RCX)=iso
+    // Returns: RAX = deopt flag (0 = normal, nonzero = deopt offset+1)
+    // The JIT stores the acc value in regs[0] before returning (via Star r0
+    // or the Return handler).
+    a.mov(acc, rdi);         // acc = arg1 (raw bits)
     // RSI already has regs (arg2)
-    // Now RDI needs to be arg3 (RDX), but RDX was clobbered by mov(acc, rdi)?
-    // No — we haven't modified RDX. But we need to move RDX to RDI.
-    // The issue: RDI currently has acc (arg1), and RDX has frame (arg3).
-    // We want RDI = frame. So:
-    a.mov(frame, rdx);     // frame = arg3
-    a.mov(iso, rcx);       // iso = arg4
-    a.mov(deopt_ptr, r8);  // deopt_ptr = arg5
-    // Clear the deopt flag.
-    a.mov(x86::ptr(deopt_ptr), 0);
+    a.mov(frame, rdx);       // frame = arg3
+    a.mov(iso, rcx);         // iso = arg4
 
     // Labels for each bytecode offset (for jump patching).
     // We create a label per bytecode instruction.
@@ -324,29 +329,30 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
 
             // ----- Inc/Dec -----
             case Op::Inc: {
-                // acc = acc + 2 - 1 = acc + 1 (Smi increment)
-                a.add(acc, 1);
+                // Smi increment: tagged value += 2 (not 1!)
+                // Smi(n) = (n << 1) | 1. Smi(n+1) = ((n+1) << 1) | 1 = Smi(n) + 2.
+                a.add(acc, 2);
                 a.jo(labels[bc.size()]);
                 break;
             }
             case Op::Dec: {
-                a.sub(acc, 1);
+                a.sub(acc, 2);
                 a.jo(labels[bc.size()]);
                 break;
             }
             case Op::IncReg: {
                 uint8_t r = bc[i + 1];
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                a.add(scratch1, 1);
+                a.add(scratch1, 2);
                 a.jo(labels[bc.size()]);
                 a.mov(x86::ptr(regs, r * 8), scratch1);
-                a.mov(acc, scratch1);  // acc = result
+                a.mov(acc, scratch1);
                 break;
             }
             case Op::DecReg: {
                 uint8_t r = bc[i + 1];
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                a.sub(scratch1, 1);
+                a.sub(scratch1, 2);
                 a.jo(labels[bc.size()]);
                 a.mov(x86::ptr(regs, r * 8), scratch1);
                 a.mov(acc, scratch1);
@@ -382,32 +388,21 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
                 // Compare unshifted values.
                 a.cmp(acc, scratch1);
                 // Set acc = Smi(0) or Smi(1) based on condition.
-                a.mov(acc, kSmiTag);  // Smi(0) = 1
+                a.mov(acc, kSmiTag);  // Smi(0) = 1 (default: false)
                 switch (op) {
-                    case Op::TestLessThan:
-                        a.setl(scratch2.r8());
-                        break;
-                    case Op::TestGreaterThan:
-                        a.setg(scratch2.r8());
-                        break;
-                    case Op::TestLessThanOrEqual:
-                        a.setle(scratch2.r8());
-                        break;
-                    case Op::TestGreaterThanOrEqual:
-                        a.setge(scratch2.r8());
-                        break;
-                    case Op::TestEqStrict:
-                        a.sete(scratch2.r8());
-                        break;
+                    case Op::TestLessThan:     a.setl(scratch2.r8()); break;
+                    case Op::TestGreaterThan:  a.setg(scratch2.r8()); break;
+                    case Op::TestLessThanOrEqual:    a.setle(scratch2.r8()); break;
+                    case Op::TestGreaterThanOrEqual: a.setge(scratch2.r8()); break;
+                    case Op::TestEqStrict:     a.sete(scratch2.r8()); break;
                     default: break;
                 }
-                // If condition true, acc = Smi(1) = 3
-                a.mov(scratch1, 3);  // Smi(1) = (1<<1)|1 = 3
-                a.cmovnz(acc, scratch1);  // if scratch2 != 0, acc = Smi(1)
-                // Wait, cmovnz checks ZF which was set by setcc. setcc
-                // sets the byte to 1 if condition true, 0 if false.
-                // We need to test scratch2.
-                a.test(scratch2, 0xFF);
+                // Zero-extend the byte to full 64-bit (setcc only sets low 8 bits,
+                // upper bits are garbage). movzx clears the upper bits.
+                a.movzx(scratch2, scratch2.r8());
+                // If condition true (scratch2 != 0), acc = Smi(1) = 3.
+                a.mov(scratch1, 3);  // Smi(1) = (1 << 1) | 1 = 3
+                a.test(scratch2, scratch2);
                 a.cmovnz(acc, scratch1);
                 break;
             }
@@ -454,8 +449,9 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
 
             // ----- Returns -----
             case Op::Return:
-                // Deopt flag is already 0 (set in prologue, never changed
-                // for Return since we don't deopt).
+                // Store acc in regs[0] and return 0 (no deopt).
+                a.mov(x86::ptr(regs, 0), acc);
+                a.xor_(acc, acc);  // return 0 = no deopt
                 a.pop(r15);
                 a.pop(r14);
                 a.pop(r13);
@@ -465,8 +461,9 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
                 break;
 
             case Op::ReturnUndefined:
-                // Deopt: return with deopt flag set.
-                a.mov(x86::ptr(deopt_ptr), static_cast<uint64_t>(i + 1));
+                // Store acc in regs[0] and return deopt flag = offset+1.
+                a.mov(x86::ptr(regs, 0), acc);
+                a.mov(acc, static_cast<uint64_t>(i + 1));
                 a.pop(r15);
                 a.pop(r14);
                 a.pop(r13);
@@ -476,11 +473,9 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
                 break;
 
             default:
-                // Unsupported opcode: deopt to interpreter at this offset.
-                // We return acc (the current accumulator value) in RAX,
-                // and signal deopt by setting RDX = bytecode offset + 1
-                // (0 = no deopt, nonzero = deopt at offset RDX-1).
-                a.mov(x86::ptr(deopt_ptr), static_cast<uint64_t>(i + 1));  // deopt flag
+                // Unsupported opcode: store acc in regs[0], return deopt flag = offset+1.
+                a.mov(x86::ptr(regs, 0), acc);
+                a.mov(acc, static_cast<uint64_t>(i + 1));
                 a.pop(r15);
                 a.pop(r14);
                 a.pop(r13);
@@ -495,7 +490,8 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
 
     // Deopt label (used by Smi-check failures and overflow).
     a.bind(labels[bc.size()]);
-    a.mov(x86::ptr(deopt_ptr), static_cast<uint64_t>(0xDEAD));  // deopt sentinel
+    a.mov(x86::ptr(regs, 0), acc);  // store acc
+    a.mov(acc, static_cast<uint64_t>(0xDEAD));  // deopt sentinel
     a.pop(r15);
     a.pop(r14);
     a.pop(r13);
