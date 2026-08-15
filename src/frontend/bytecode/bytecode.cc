@@ -151,10 +151,59 @@ const OpInfo& GetOpInfo(Op op) {
     return kOpInfos[static_cast<size_t>(op)];
 }
 
-// Resolve a Constant entry to a runtime Value, allocating heap objects as
-// needed. Called by the interpreter for LdaConst / AddConst / etc.
+// Pre-resolve all constants (except kFunctionInfo) into a heap-allocated
+// array. Called once at the end of compilation. After this, ResolveConstant
+// is a single array load for all kinds except kFunctionInfo.
+void FunctionInfo::PreResolveConstants(Isolate* iso) {
+    if (resolved_constants != nullptr) return;  // already resolved
+    if (constants.empty()) return;
+    // Allocate a raw array of uintptr_t, one per constant.
+    resolved_constants = new uintptr_t[constants.size()]();  // zero-initialized
+    for (size_t i = 0; i < constants.size(); ++i) {
+        const Constant& c = constants[i];
+        Value v;
+        switch (c.kind) {
+            case Constant::Kind::kSmi:
+                v = Value::FromSmi(static_cast<intptr_t>(c.smi));
+                break;
+            case Constant::Kind::kNumber:
+                v = Value::FromHeap(JSNumber::New(iso, c.number));
+                break;
+            case Constant::Kind::kString:
+                V12_DCHECK(c.index < property_names.size(),
+                           "string constant index out of range");
+                v = Value::FromHeap(JSString::New(iso, property_names[c.index]));
+                break;
+            case Constant::Kind::kBoolean:
+                v = c.boolean ? iso->true_value() : iso->false_value();
+                break;
+            case Constant::Kind::kUndefined:
+                v = iso->undefined_value();
+                break;
+            case Constant::Kind::kNull:
+                v = iso->null_value();
+                break;
+            case Constant::Kind::kFunctionInfo:
+                // Not pre-resolved — handled by CreateClosure directly.
+                continue;
+        }
+        resolved_constants[i] = v.raw().raw_bits();
+    }
+}
+
+// Resolve a Constant entry to a runtime Value. After PreResolveConstants,
+// this is a single array load (resolved_constants[idx]) for all kinds
+// except kFunctionInfo — no heap allocation, no switch.
 Value FunctionInfo::ResolveConstant(Isolate* iso, uint32_t idx) const {
     V12_DCHECK(idx < constants.size(), "constant index out of range");
+    // Fast path: pre-resolved constant.
+    if (resolved_constants != nullptr) {
+        uintptr_t raw = resolved_constants[idx];
+        if (raw != 0) {
+            return Value(TaggedValue::FromRawBits(raw));
+        }
+    }
+    // Slow path: kFunctionInfo or pre-resolution not done.
     const Constant& c = constants[idx];
     switch (c.kind) {
         case Constant::Kind::kSmi:
@@ -172,10 +221,6 @@ Value FunctionInfo::ResolveConstant(Isolate* iso, uint32_t idx) const {
         case Constant::Kind::kNull:
             return iso->null_value();
         case Constant::Kind::kFunctionInfo:
-            // FunctionInfo constants are resolved by the interpreter (which
-            // needs to wrap them in a JSFunction with the right closure
-            // context). Return undefined here; this path should not be
-            // hit through LdaConst.
             return iso->undefined_value();
     }
     return iso->undefined_value();

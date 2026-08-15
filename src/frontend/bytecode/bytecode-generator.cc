@@ -241,6 +241,18 @@ size_t BytecodeGenerator::PeepholeOptimize(FunctionInfo* fi) {
 
         i = next;
     }
+
+    // Pre-allocate the IC entries vector to feedback_vector_length. This
+    // makes GetIC's bounds-check branch always not-taken (predicted
+    // correctly) after compilation, eliminating the resize() path.
+    fi->EnsureICCapacity();
+
+    // Pre-resolve all constants into a heap-allocated array. After this,
+    // ResolveConstant is a single array load — no heap allocation on
+    // LdaConst/AddConst/MulConst/etc. Big win for loops with non-Smi
+    // literals (e.g. `s += "x"` or `i < 100000`).
+    fi->PreResolveConstants(iso_);
+
     return removed;
 }
 

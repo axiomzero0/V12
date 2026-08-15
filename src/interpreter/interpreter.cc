@@ -46,13 +46,6 @@
 
 namespace v12 {
 
-// Global deopt flag. JIT code writes to this when it needs to deopt.
-// 0 = no deopt, nonzero = deopt at bytecode offset (flag-1).
-// 0xDEAD = generic deopt (resume from JumpLoop target).
-// Marked volatile so the compiler doesn't cache the value across the
-// JIT call (the JIT modifies it through a pointer).
-volatile uintptr_t g_jit_deopt_flag = 0;
-
 // -----------------------------------------------------------------------------
 // Construction / destruction
 // -----------------------------------------------------------------------------
@@ -651,27 +644,36 @@ InterpResult Interp::ExecuteTop() {
                     }
                 }
                 // Execute JIT if available and not too many deopts.
+                // Allow up to 10 deopts before giving up (V8 uses ~10).
                 if (V12_UNLIKELY(info->jit_code != 0 &&
-                                 info->deopt_count < 3)) {
+                                 info->deopt_count < 10)) {
                     auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
-                    // Simplified protocol: JIT returns a raw uintptr_t in RAX.
-                    // 0 = normal return, nonzero = deopt at offset (val-1).
-                    // The JIT stores the acc value in regs[0] before returning.
+                    // JIT calling convention (System V AMD64):
+                    //   arg1 (RDI) = acc   (uintptr_t, raw tagged bits)
+                    //   arg2 (RSI) = regs  (Value*)
+                    //   arg3 (RDX) = frame (void*)
+                    //   arg4 (RCX) = iso   (Isolate*)
+                    // Returns: 0 = normal return, nonzero = deopt.
+                    //   0xDEAD = deopt at JumpLoop target (Smi check failure).
+                    //   other nonzero = deopt at bytecode offset (ret-1).
                     typedef uintptr_t (*JitEntry)(uintptr_t acc, Value* regs,
                                                  void* frame, Isolate* iso);
                     auto entry = reinterpret_cast<JitEntry>(co->entry_point());
                     uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
                     if (ret != 0) {
-                        // Deopt: increment counter and resume interpreter.
-                        info->deopt_count = 100; // give up on JIT after first deopt
-                        uint32_t resume_pc = (ret == 0xDEAD || ret == 0xCAFE)
+                        // Deopt: increment counter (don't kill JIT immediately).
+                        // Allow re-entry after cooldown — the JIT will be
+                        // re-entered on the next JumpLoop if deopt_count < 10.
+                        info->deopt_count++;
+                        uint32_t resume_pc = (ret == 0xDEAD)
                             ? target
                             : static_cast<uint32_t>(ret - 1);
                         pc = bytecode_base + resume_pc;
                         acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
                         V12_DISPATCH();
                     }
-                    // Normal return.
+                    // Normal return: the JIT'd function executed a Return or
+                    // ReturnUndefined. Read acc from regs[0] and pop the frame.
                     acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
                     if (frame_top_ > 1) {
                         PopFrame();

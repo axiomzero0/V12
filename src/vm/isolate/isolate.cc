@@ -19,27 +19,47 @@ namespace {
 
 Isolate* g_current_isolate = nullptr;
 
-// Simple string interner backed by an unordered_map<string, string_view>.
-// The string data is owned by the interner (heap-allocated) so that
-// string_views remain stable across map rehashes.
+// String interner backed by an unordered_map<string_view, string_view> with
+// a transparent hash. The string data is owned by the interner (heap-allocated
+// via new char[]) so that string_views remain stable across map rehashes.
+//
+// IMPORTANT: The key type is std::string_view (NOT std::string). This means
+// lookups via find(string_view) do NOT allocate a temporary std::string —
+// they hash and compare the string_view directly. The previous implementation
+// allocated a std::string on every single lookup, which dominated allocation
+// cost for property-name-heavy code.
+//
+// NOTE: The interned string buffers are intentionally NOT freed in the
+// destructor. They are referenced by Shape transition tables and
+// FunctionInfo::property_names (as string_views) which outlive the interner
+// during Isolate destruction (the interner is destroyed before the heap).
+// Freeing them here would create dangling pointers. The OS reclaims this
+// memory when the process exits.
 class InternerImpl : public Interner {
 public:
     std::string_view Intern(std::string_view s) {
-        auto it = strings_.find(std::string(s));
+        auto it = strings_.find(s);
         if (it != strings_.end()) return it->second;
         // Allocate a permanent copy.
         char* buf = new char[s.size() + 1];
         std::memcpy(buf, s.data(), s.size());
         buf[s.size()] = '\0';
         std::string_view stored(buf, s.size());
-        strings_[std::string(s)] = stored;
+        // Both key and value point to the same owned buffer.
+        strings_[stored] = stored;
         return stored;
     }
     bool IsInterned(std::string_view s) const {
-        return strings_.find(std::string(s)) != strings_.end();
+        return strings_.find(s) != strings_.end();
     }
 private:
-    std::unordered_map<std::string, std::string_view> strings_;
+    // FNV-1a hash for string_view (transparent — no allocation).
+    struct StringViewHash {
+        size_t operator()(std::string_view s) const noexcept {
+            return Fnv1aHash(s.data(), s.size());
+        }
+    };
+    std::unordered_map<std::string_view, std::string_view, StringViewHash> strings_;
 };
 
 }  // namespace

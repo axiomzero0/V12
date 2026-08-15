@@ -29,7 +29,7 @@ case "$MODE" in
         CXXFLAGS="${CXXFLAGS_COMMON} -O0 -DV12_DEBUG=1"
         ;;
     release)
-        CXXFLAGS="${CXXFLAGS_COMMON} -O3 -DNDEBUG"
+        CXXFLAGS="${CXXFLAGS_COMMON} -O3 -DNDEBUG ${V12_EXTRA_FLAGS:-}"
         ;;
     release-opt)
         # Maximum optimization: LTO + march=native + fno-plt

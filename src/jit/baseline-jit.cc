@@ -36,8 +36,16 @@ namespace v12 {
 
 using namespace asmjit;
 
-// External declaration of the interpreter's deopt flag (defined in interpreter.cc).
-extern volatile uintptr_t g_jit_deopt_flag;
+// The JIT entry point is called by the interpreter with 4 arguments
+// (System V AMD64 ABI):
+//   arg1 (RDI) = acc   (uintptr_t, raw tagged bits)
+//   arg2 (RSI) = regs  (Value*)
+//   arg3 (RDX) = frame (void*)
+//   arg4 (RCX) = iso   (Isolate*)
+//
+// The JIT rearranges these into its internal register convention in the
+// prologue. There is no separate deopt_flag argument — deopt is signaled
+// by the JIT's return value (nonzero = deopt at offset ret-1).
 
 // Smi tag constants (must match TaggedValue).
 static constexpr uint64_t kSmiTag = 1;
@@ -106,38 +114,36 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
     //   rsi = regs base
     //   rdi = Frame*
     //   r12 = Isolate*
-    //   r14 = deopt_flag pointer
     //   rcx, rdx = scratch
     //
-    // The JIT entry point follows System V AMD64 ABI:
-    //   arg1 (RDI) = deopt_flag (uintptr_t*)
-    //   arg2 (RSI) = acc (uintptr_t, raw bits)
-    //   arg3 (RDX) = regs (Value*)
-    //   arg4 (RCX) = frame (void*)
-    //   arg5 (R8)  = iso (Isolate*)
-    //
-    // We rearrange to our internal convention in the prologue.
+    // The JIT entry point is called by the interpreter with:
+    //   arg1 (RDI) = acc   (uintptr_t, raw tagged bits)
+    //   arg2 (RSI) = regs  (Value*)
+    //   arg3 (RDX) = frame (void*)
+    //   arg4 (RCX) = iso   (Isolate*)
     const x86::Gp acc = rax;
     const x86::Gp regs = rsi;
     const x86::Gp frame = rdi;
     const x86::Gp iso = r12;
-    const x86::Gp deopt_ptr = r14;
     const x86::Gp scratch1 = rcx;
     const x86::Gp scratch2 = rdx;
 
-    // Prologue: save callee-saved registers.
-    a.push(rbx);
+    // Prologue: save callee-saved registers that we actually clobber.
+    // We clobber r12 (iso) and r14 (not used anymore — but keep for ABI).
+    // We do NOT clobber rbx, r13, r15 — so don't save them (saves 6
+    // memory ops per JIT entry/exit).
     a.push(r12);
-    a.push(r13);
     a.push(r14);
-    a.push(r15);
 
     // Rearrange args from ABI to internal convention:
-    a.mov(deopt_ptr, rdi);  // deopt_ptr = arg1
-    a.mov(acc, rsi);         // acc = arg2
-    a.mov(regs, rdx);        // regs = arg3
-    a.mov(frame, rcx);       // frame = arg4
-    a.mov(iso, r8);          // iso = arg5
+    // arg1 (RDI) = acc → rax
+    // arg2 (RSI) = regs → stays rsi
+    // arg3 (RDX) = frame → rdi
+    // arg4 (RCX) = iso → r12
+    a.mov(acc, rdi);         // acc = arg1
+    // regs already in rsi (arg2)
+    a.mov(frame, rdx);       // frame = arg3
+    a.mov(iso, rcx);         // iso = arg4
 
     // Labels for each bytecode offset (for jump patching).
     std::vector<Label> labels(bc.size() + 1);
@@ -184,13 +190,21 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
 
             case Op::LdaConst: {
                 // LdaConst: op  const_idx:32  idx:16
-                // We can't call ResolveConstant at JIT time (it allocates
-                // heap objects). Instead, for Smi constants we embed the
-                // value directly. For non-Smi constants, we deopt.
+                // If the constants have been pre-resolved (by PreResolveConstants),
+                // we can load the value directly from the resolved_constants
+                // array — no deopt needed for any constant kind.
                 uint32_t cidx = static_cast<uint32_t>(bc[i+1]) |
                                 (static_cast<uint32_t>(bc[i+2]) << 8) |
                                 (static_cast<uint32_t>(bc[i+3]) << 16) |
                                 (static_cast<uint32_t>(bc[i+4]) << 24);
+                if (fi->resolved_constants != nullptr &&
+                    cidx < fi->constants.size() &&
+                    fi->resolved_constants[cidx] != 0) {
+                    // Load the pre-resolved value (raw tagged bits).
+                    a.mov(acc, static_cast<uint64_t>(fi->resolved_constants[cidx]));
+                    break;
+                }
+                // Fallback: for Smi constants, embed directly.
                 if (cidx < fi->constants.size()) {
                     const Constant& c = fi->constants[cidx];
                     if (c.kind == Constant::Kind::kSmi) {
@@ -198,7 +212,7 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                         break;
                     }
                 }
-                // Non-Smi constant → deopt.
+                // Non-Smi constant without pre-resolution → deopt.
                 a.jmp(labels[bc.size()]);
                 break;
             }
@@ -442,39 +456,37 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
             }
 
             // ----- Returns -----
+            // Return protocol: store acc in regs[0], return 0 (normal return).
+            // The interpreter reads acc from regs[0] on normal return.
             case Op::Return:
-                // Store acc in regs[0] and return 0 (no deopt).
                 a.mov(x86::ptr(regs, 0), acc);
-                a.xor_(acc, acc);  // return 0 = no deopt
-                a.pop(r15);
+                a.xor_(acc, acc);  // return 0 = normal return
                 a.pop(r14);
-                a.pop(r13);
                 a.pop(r12);
-                a.pop(rbx);
                 a.ret();
                 break;
 
-            case Op::ReturnUndefined:
-                // Store acc in regs[0] and return deopt flag = offset+1.
-                a.mov(x86::ptr(regs, 0), acc);
-                a.mov(acc, static_cast<uint64_t>(i + 1));
-                a.pop(r15);
+            case Op::ReturnUndefined: {
+                // Store undefined in regs[0] and return 0 (normal return).
+                // We embed the undefined value's raw bits as a constant
+                // (obtained from Isolate::Current() at compile time).
+                uintptr_t undef_bits = Isolate::Current()->undefined_value()
+                                          .raw().raw_bits();
+                a.mov(x86::ptr(regs, 0), static_cast<uint64_t>(undef_bits));
+                a.xor_(acc, acc);  // return 0 = normal return
                 a.pop(r14);
-                a.pop(r13);
                 a.pop(r12);
-                a.pop(rbx);
                 a.ret();
                 break;
+            }
 
             default:
-                // Unsupported opcode: store acc in regs[0], return deopt flag = offset+1.
+                // Unsupported opcode: store acc in regs[0], return deopt
+                // flag = offset+1 (nonzero = deopt at bytecode offset ret-1).
                 a.mov(x86::ptr(regs, 0), acc);
                 a.mov(acc, static_cast<uint64_t>(i + 1));
-                a.pop(r15);
                 a.pop(r14);
-                a.pop(r13);
                 a.pop(r12);
-                a.pop(rbx);
                 a.ret();
                 break;
         }
@@ -483,14 +495,13 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
     }
 
     // Deopt label (used by Smi-check failures and overflow).
+    // Store acc in regs[0], return 0xDEAD (special deopt sentinel that
+    // tells the interpreter to resume at the JumpLoop target).
     a.bind(labels[bc.size()]);
     a.mov(x86::ptr(regs, 0), acc);  // store acc
     a.mov(acc, static_cast<uint64_t>(0xDEAD));  // deopt sentinel
-    a.pop(r15);
     a.pop(r14);
-    a.pop(r13);
     a.pop(r12);
-    a.pop(rbx);
     a.ret();
 
     // Get the emitted code.

@@ -287,7 +287,19 @@ struct FunctionInfo {
     };
     std::vector<ICEntry> ic_entries;
 
-    // Get the IC entry for a feedback slot index. Grows the vector as needed.
+    // Pre-allocate the IC entries vector to feedback_vector_length. Call this
+    // once at the end of compilation (after all feedback slots have been
+    // allocated). After this, GetIC's bounds-check branch is always
+    // not-taken (predicted correctly), eliminating the resize() path.
+    void EnsureICCapacity() {
+        if (ic_entries.size() < feedback_vector_length) {
+            ic_entries.resize(feedback_vector_length);
+        }
+    }
+
+    // Get the IC entry for a feedback slot index. The vector is pre-allocated
+    // by EnsureICCapacity at compile time; the bounds check remains as a
+    // safety net (and is predicted not-taken after warmup).
     ICEntry& GetIC(uint16_t idx) {
         if (idx >= ic_entries.size()) ic_entries.resize(idx + 1);
         return ic_entries[idx];
@@ -318,8 +330,17 @@ struct FunctionInfo {
     }
 
     // Look up a constant's Value at runtime. Returns the appropriate Value
-    // (Smi, HeapNumber, JSString, etc.) given an Isolate.
+    // (Smi, HeapNumber, JSString, etc.) given an Isolate. After
+    // PreResolveConstants has been called, this is a single array load for
+    // all kinds except kFunctionInfo.
     Value ResolveConstant(Isolate* iso, uint32_t idx) const;
+
+    // Pre-resolve all constants (except kFunctionInfo) into a heap-allocated
+    // array parallel to `constants`. After this, ResolveConstant never
+    // allocates heap objects — it just loads from resolved_constants[idx].
+    // Uses a raw pointer (8 bytes) instead of a vector (24 bytes) to minimize
+    // the FunctionInfo size increase.
+    void PreResolveConstants(Isolate* iso);
 
     // ----- Lazy compilation -----
     // If false, this function's bytecode has not been compiled yet. The
@@ -346,6 +367,13 @@ struct FunctionInfo {
     void* lazy_ast = nullptr;       // FunctionDecl* / FunctionExpr* / ArrowFunction*
     void* lazy_scope = nullptr;     // Scope*
     bool lazy_is_toplevel = false;
+
+    // Pointer to a heap-allocated array of resolved constant Values (raw
+    // tagged bits), parallel to `constants`. nullptr = not yet pre-resolved.
+    // 0 entries (kFunctionInfo) are left as 0 in the array.
+    // Placed at the very end of FunctionInfo (8 bytes) to minimize impact on
+    // hot-field cache-line alignment.
+    uintptr_t* resolved_constants = nullptr;
 };
 
 // BytecodeProgram: the result of compiling a whole source file. Owns:
