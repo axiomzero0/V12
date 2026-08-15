@@ -325,6 +325,7 @@ struct FunctionInfo {
     // Tier-up counter for OSR. Incremented on JumpLoop; when it crosses
     // a threshold, the interpreter triggers baseline JIT compilation.
     uint32_t hotness_counter = 0;
+    uint32_t deopt_count = 0;  // number of times JIT code deopted
 
     // Pointer to the baseline JIT CodeObject (if compiled). nullptr means
     // no JIT code has been generated yet. Forward-declared — the full

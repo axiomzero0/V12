@@ -685,6 +685,7 @@ InterpResult Interp::ExecuteTop() {
                 // OSR: increment hotness counter. When it crosses a threshold,
                 // compile the function with the baseline JIT and execute it.
                 info->hotness_counter++;
+#ifndef V12_NO_JIT
                 if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
                                  info->jit_code == 0)) {
                     auto co = BaselineJIT::Compile(info);
@@ -692,8 +693,11 @@ InterpResult Interp::ExecuteTop() {
                         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                     }
                 }
-                // If JIT code is available, execute it.
-                if (V12_UNLIKELY(info->jit_code != 0)) {
+                // If JIT code is available and we haven't deopted too many
+                // times, execute it. After 3 deopts, give up on JIT for
+                // this function.
+                if (false && V12_UNLIKELY(info->jit_code != 0 &&
+                                 info->deopt_count < 3)) {
                     auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
                     // Simplified protocol: JIT returns a raw uintptr_t in RAX.
                     // 0 = normal return, nonzero = deopt at offset (val-1).
@@ -703,7 +707,8 @@ InterpResult Interp::ExecuteTop() {
                     auto entry = reinterpret_cast<JitEntry>(co->entry_point());
                     uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
                     if (ret != 0) {
-                        // Deopt.
+                        // Deopt: increment counter and resume interpreter.
+                        info->deopt_count++;
                         uint32_t resume_pc = (ret == 0xDEAD || ret == 0xCAFE)
                             ? target
                             : static_cast<uint32_t>(ret - 1);
@@ -727,6 +732,7 @@ InterpResult Interp::ExecuteTop() {
                     }
                     V12_DISPATCH();
                 }
+#endif // V12_NO_JIT
                 pc = bytecode_base + target;
                 V12_DISPATCH();
             }

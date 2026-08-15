@@ -200,13 +200,20 @@ size_t BytecodeGenerator::PeepholeOptimize(FunctionInfo* fi) {
         if (op == Op::Ldar && next_op == Op::Star &&
             oi.length == 2 && next_oi.length == 2 &&
             bc[i + 1] == bc[next + 1]) {
-            // Nop out the Star (2 bytes).
             bc[next] = static_cast<uint8_t>(Op::Nop);
             bc[next + 1] = static_cast<uint8_t>(Op::Nop);
             removed += 2;
         }
         // Pattern: Star r; Ldar r  (same register — Ldar is a no-op)
         else if (op == Op::Star && next_op == Op::Ldar &&
+                   oi.length == 2 && next_oi.length == 2 &&
+                   bc[i + 1] == bc[next + 1]) {
+            bc[next] = static_cast<uint8_t>(Op::Nop);
+            bc[next + 1] = static_cast<uint8_t>(Op::Nop);
+            removed += 2;
+        }
+        // Pattern: Ldar r; Ldar r  (second Ldar is redundant — acc already has r)
+        else if (op == Op::Ldar && next_op == Op::Ldar &&
                    oi.length == 2 && next_oi.length == 2 &&
                    bc[i + 1] == bc[next + 1]) {
             bc[next] = static_cast<uint8_t>(Op::Nop);

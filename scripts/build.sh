@@ -34,9 +34,11 @@ case "$MODE" in
     release-opt)
         # Maximum optimization: LTO + march=native + fno-plt
         # ~1.5x faster than plain release on interpreter workloads.
-        # Note: -flto=thin is Clang-only; GCC uses -flto (which is thin by default in GCC 14+).
         CXXFLAGS="${CXXFLAGS_COMMON} -O3 -DNDEBUG -flto -march=native -fno-plt"
         LDFLAGS="-flto"
+        # For release-opt, compile tools by linking all sources together
+        # (not via archive) so LTO can inline across translation units.
+        COMPILE_TOOLS_WITH_SOURCES=1
         ;;
     pgo)
         # Profile-Guided Optimization: two-phase build.
@@ -113,24 +115,45 @@ ar rcs "${BUILD_DIR}/libv12.a" ${OBJ_FILES}
 # Build tools.
 echo "==> Building tools..."
 
-# js-shell needs builtins.cc compiled in.
-echo "  LD  js-shell"
-${CXX} ${CXXFLAGS} ${LDFLAGS:-} \
-    "${TOOLS_DIR}/js-shell/js-shell.cc" \
-    "${TOOLS_DIR}/js-shell/builtins.cc" \
-    -o "${BUILD_DIR}/bin/js-shell" \
-    -L"${BUILD_DIR}" -lv12 -lpthread || echo "    (failed, continuing)"
-
-# Other tools are single-file.
-for tool_src in "${TOOLS_DIR}"/bytecode-dump/bytecode-dump.cc \
-                "${TOOLS_DIR}"/ir-dump/ir-dump.cc; do
-    if [ -f "${tool_src}" ]; then
-        tool_name=$(basename "${tool_src}" .cc)
-        echo "  LD  ${tool_name}"
-        ${CXX} ${CXXFLAGS} ${LDFLAGS:-} "${tool_src}" -o "${BUILD_DIR}/bin/${tool_name}" \
-            -L"${BUILD_DIR}" -lv12 -lpthread || echo "    (failed, continuing)"
-    fi
-done
+if [ "${COMPILE_TOOLS_WITH_SOURCES:-0}" = "1" ]; then
+    # Release-opt: compile tools with all sources together for maximum LTO.
+    ALL_SOURCES="${SRCS} ${ASMJIT_SRCS}"
+    echo "  LD  js-shell (with all sources)"
+    ${CXX} ${CXXFLAGS} ${LDFLAGS:-} \
+        ${ALL_SOURCES} \
+        "${TOOLS_DIR}/js-shell/js-shell.cc" \
+        "${TOOLS_DIR}/js-shell/builtins.cc" \
+        -o "${BUILD_DIR}/bin/js-shell" \
+        -lpthread || echo "    (failed, continuing)"
+    for tool_src in "${TOOLS_DIR}"/bytecode-dump/bytecode-dump.cc \
+                    "${TOOLS_DIR}"/ir-dump/ir-dump.cc; do
+        if [ -f "${tool_src}" ]; then
+            tool_name=$(basename "${tool_src}" .cc)
+            echo "  LD  ${tool_name} (with all sources)"
+            ${CXX} ${CXXFLAGS} ${LDFLAGS:-} \
+                ${ALL_SOURCES} "${tool_src}" \
+                -o "${BUILD_DIR}/bin/${tool_name}" \
+                -lpthread || echo "    (failed, continuing)"
+        fi
+    done
+else
+    # Normal: link against archive.
+    echo "  LD  js-shell"
+    ${CXX} ${CXXFLAGS} ${LDFLAGS:-} \
+        "${TOOLS_DIR}/js-shell/js-shell.cc" \
+        "${TOOLS_DIR}/js-shell/builtins.cc" \
+        -o "${BUILD_DIR}/bin/js-shell" \
+        -L"${BUILD_DIR}" -lv12 -lpthread || echo "    (failed, continuing)"
+    for tool_src in "${TOOLS_DIR}"/bytecode-dump/bytecode-dump.cc \
+                    "${TOOLS_DIR}"/ir-dump/ir-dump.cc; do
+        if [ -f "${tool_src}" ]; then
+            tool_name=$(basename "${tool_src}" .cc)
+            echo "  LD  ${tool_name}"
+            ${CXX} ${CXXFLAGS} ${LDFLAGS:-} "${tool_src}" -o "${BUILD_DIR}/bin/${tool_name}" \
+                -L"${BUILD_DIR}" -lv12 -lpthread || echo "    (failed, continuing)"
+        fi
+    done
+fi
 
 # Build tests using the custom test framework.
 if [ "$MODE" = "tests" ] || [ "$MODE" = "debug" ]; then

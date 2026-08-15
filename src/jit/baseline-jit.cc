@@ -233,42 +233,18 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi) {
             // If not Smi or overflow, deopt.
             case Op::Add: {
                 uint8_t r = bc[i + 1];
-                // scratch1 = regs[r] (right operand)
+                
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                // Check both acc and scratch1 are Smis: test low bit.
-                // test acc, 1; jz .deopt
+                // Check both are Smis.
                 a.test(acc, 1);
-                a.jz(labels[bc.size()]);  // deopt label (end)
+                a.jz(labels[bc.size()]);
                 a.test(scratch1, 1);
                 a.jz(labels[bc.size()]);
-                // Smi add: shift right by 1 (remove tag), add, shift left,
-                // set tag. Actually, since both are tagged, we can:
-                //   shr acc, 1       (get value, lose tag)
-                //   add acc, scratch1 (add tagged right = value*2+1)
-                //   jo .deopt          (overflow check)
-                // Wait, that's not right. Let me think...
-                // Smi(a) + Smi(b) = (a>>1 << 1 | 1) + (b>>1 << 1 | 1)
-                //                 = (a_val + b_val) << 1 | 1
-                // Since a = a_val*2 + 1 and b = b_val*2 + 1:
-                //   a + b = (a_val + b_val)*2 + 2 = (a_val + b_val)*2 | 0
-                // That's wrong — the tag bit is 0, not 1.
-                // Actually: a + b = a_val*2 + 1 + b_val*2 + 1
-                //                = (a_val + b_val)*2 + 2
-                //                = (a_val + b_val + 1)*2
-                // Hmm, that's still not right.
-                //
-                // Let me think again. Smi value = (v << 1) | 1.
-                // a = (av << 1) | 1, b = (bv << 1) | 1
-                // a + b = (av << 1) + (bv << 1) + 2
-                //       = ((av + bv) << 1) + 2
-                //       = ((av + bv + 1) << 1) | 0  -- wrong tag!
-                //
-                // The correct approach: a + b - 1 = (av + bv) << 1 | 1
-                // So: add acc, scratch1; sub acc, 1; jo deopt
-                // Wait: a + b = (av+bv)*2 + 2. We want (av+bv)*2 + 1.
-                // So a + b - 1 = (av+bv)*2 + 1. Correct!
+                // Smi add: a + b - 1 = correct tagged result.
                 a.add(acc, scratch1);
-                a.jo(labels[bc.size()]);  // overflow → deopt
+                
+                a.jo(labels[bc.size()]);
+                
                 a.sub(acc, 1);
                 break;
             }
