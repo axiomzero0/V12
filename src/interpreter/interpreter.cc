@@ -822,16 +822,18 @@ InterpResult Interp::ExecuteTop() {
             L_LoadGlobal: {
                 uint8_t name_idx = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
-                JSObject* g = iso_->global_object();
-                Shape* gshape = g->shape();
                 auto& ic = info->GetIC(ic_slot);
-                if (V12_LIKELY(ic.initialized &&
-                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
-                    // IC hit: direct property load, no string compare.
-                    acc = g->properties()[ic.slot];
+                // Fast path: if we have a cached value pointer, just load it.
+                // This is 2 operations: load ic.value_ptr, load *ptr.
+                // No shape compare, no GetIC vector lookup on the hot path.
+                if (V12_LIKELY(ic.value_ptr != 0)) {
+                    acc = *reinterpret_cast<Value*>(ic.value_ptr);
                     V12_DISPATCH();
                 }
-                // IC miss: linear scan the shape's properties.
+                // Slow path: first-time lookup. Find the slot, cache the
+                // direct pointer to the property slot.
+                JSObject* g = iso_->global_object();
+                Shape* gshape = g->shape();
                 std::string_view name = info->property_names[name_idx];
                 Shape::Slot slot = Shape::kInvalidSlot;
                 for (uint16_t i = 0; i < gshape->property_count(); ++i) {
@@ -844,6 +846,8 @@ InterpResult Interp::ExecuteTop() {
                     ic.shape = reinterpret_cast<uintptr_t>(gshape);
                     ic.slot = slot;
                     ic.initialized = true;
+                    // Cache the direct pointer to the property slot.
+                    ic.value_ptr = reinterpret_cast<uintptr_t>(&g->properties()[slot]);
                     acc = g->properties()[slot];
                 } else {
                     acc = iso_->undefined_value();
@@ -855,25 +859,23 @@ InterpResult Interp::ExecuteTop() {
                 (void)ReadU8(&pc);   // dummy register
                 uint8_t name_idx = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
-                JSObject* g = iso_->global_object();
-                Shape* gshape = g->shape();
                 auto& ic = info->GetIC(ic_slot);
-                if (V12_LIKELY(ic.initialized &&
-                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
-                    g->properties()[ic.slot] = acc;
+                // Fast path: direct store via cached pointer.
+                if (V12_LIKELY(ic.value_ptr != 0)) {
+                    *reinterpret_cast<Value*>(ic.value_ptr) = acc;
                     V12_DISPATCH();
                 }
+                JSObject* g = iso_->global_object();
+                Shape* gshape = g->shape();
                 std::string_view name = info->property_names[name_idx];
-                // Update the cache.
                 Shape::Slot slot = gshape->Lookup(name);
                 if (slot != Shape::kInvalidSlot) {
                     ic.shape = reinterpret_cast<uintptr_t>(gshape);
                     ic.slot = slot;
                     ic.initialized = true;
+                    ic.value_ptr = reinterpret_cast<uintptr_t>(&g->properties()[slot]);
                     g->properties()[slot] = acc;
                 } else {
-                    // Property doesn't exist yet — use SetProperty which
-                    // handles shape transitions.
                     g->SetProperty(iso_, name, acc);
                 }
                 V12_DISPATCH();
@@ -910,58 +912,43 @@ InterpResult Interp::ExecuteTop() {
             //   The interpreter looks up the property on acc to get the
             //   callee, then calls it with this = acc.
             L_Call: {
-                uint32_t call_off = static_cast<uint32_t>(
-                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
-                pc += 2;
+                pc += 2;  // skip feedback slot
 
-                Value this_val = iso_->undefined_value();
                 Value callee = acc;
                 Value* args = regs + first_arg;
 
-                // Host function: call directly and continue.
-                if (callee.IsHostFunction()) {
-                    Value result = callee.AsHostFunction()->fn()(
-                        this, this_val, const_cast<Value*>(args), argc);
-                    acc = result;
-                    V12_DISPATCH();
-                }
-                // JS function: inline the call setup (no C++ recursion).
-                if (V12_LIKELY(callee.IsFunction())) {
-                    JSFunction* fn = callee.AsFunction();
-                    FunctionInfo* callee_info = fn->shared_info();
-                    if (callee_info == nullptr) {
-                        Value exc = Value::FromHeap(JSString::New(iso_,
-                            "TypeError: not a function"));
-                        pending_exception_ = exc;
-                        uint32_t catch_off = info->FindHandler(call_off);
-                        if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                            pc = bytecode_base + catch_off;
-                            acc = exc;
-                            V12_DISPATCH();
-                        }
-                        return {InterpStatus::kThrew, exc};
+                // Fast path: JS function (the common case).
+                // Check kind directly to avoid two separate Is* calls.
+                if (V12_LIKELY(callee.IsHeapObject())) {
+                    HeapObjectKind kind = callee.AsHeapObject()->kind();
+                    if (V12_LIKELY(kind == HeapObjectKind::kFunction)) {
+                        JSFunction* fn = static_cast<JSFunction*>(callee.AsHeapObject());
+                        FunctionInfo* callee_info = fn->shared_info();
+                        // Save return PC.
+                        frame->pc = pc;
+                        // Push frame and switch to callee.
+                        regs = PushFrame(callee_info, fn, iso_->undefined_value(),
+                                         fn->closure_context(), argc, args);
+                        frame = &frames_[frame_top_ - 1];
+                        ctx = frame->context;
+                        info = callee_info;
+                        bytecode_base = info->bytecode.data();
+                        pc = bytecode_base;
+                        V12_DISPATCH();
                     }
-                    // Save the return PC in the current frame.
-                    frame->pc = pc;
-                    // Push a new frame inline. PushFrame returns the new
-                    // register file pointer. We avoid re-reading the frame
-                    // array by using the returned pointer directly.
-                    regs = PushFrame(callee_info, fn, this_val,
-                                     fn->closure_context(), argc, args);
-                    // The new frame is at frames_[frame_top_ - 1].
-                    // We need ctx from the new frame (the closure context).
-                    frame = &frames_[frame_top_ - 1];
-                    ctx = frame->context;
-                    info = callee_info;
-                    bytecode_base = info->bytecode.data();
-                    pc = bytecode_base;
-                    V12_DISPATCH();
+                    if (kind == HeapObjectKind::kExternal) {
+                        // Host function.
+                        HostFunction* hf = static_cast<HostFunction*>(callee.AsHeapObject());
+                        acc = hf->fn()(this, iso_->undefined_value(),
+                                       const_cast<Value*>(args), argc);
+                        V12_DISPATCH();
+                    }
                 }
                 // Not callable.
                 {
+                    uint32_t call_off = static_cast<uint32_t>((pc - bytecode_base) - 1);
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
                     pending_exception_ = exc;

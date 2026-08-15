@@ -272,14 +272,18 @@ struct FunctionInfo {
     // + a single property-array load — no string comparison, no linear
     // scan of the shape's property list.
     struct ICEntry {
-        // The shape seen on the last execution. nullptr means "uninitialized".
-        // We use uintptr_t to avoid header dependencies (Shape is incomplete
-        // in this file). The interpreter casts to Shape* as needed.
+        // The shape seen on the last execution. 0 means "uninitialized".
         uintptr_t shape = 0;
         // The property slot index for this shape.
         uint16_t slot = 0xFFFF;
         // Is this IC entry initialized?
         bool initialized = false;
+        // For LoadGlobal/StoreGlobal: cache the direct pointer to the
+        // property slot in the global object's properties array. This
+        // eliminates the shape compare + array index on every access.
+        // Set on first IC hit, valid as long as the global shape doesn't
+        // change (which it doesn't after startup).
+        uintptr_t value_ptr = 0;
     };
     std::vector<ICEntry> ic_entries;
 
