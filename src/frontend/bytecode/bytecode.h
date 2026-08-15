@@ -237,24 +237,65 @@ struct Constant {
     };
 };
 
+// ----- Inline cache (IC) storage -----
+// Each feedback slot (the idx:16 operand on property access opcodes)
+// maps to an ICEntry. The IC caches the (Shape, slot) pair from the
+// last execution, so the fast path is a single shape-pointer compare
+// + a single property-array load — no string comparison, no linear
+// scan of the shape's property list.
+struct ICEntry {
+    // The shape seen on the last execution. 0 means "uninitialized".
+    uintptr_t shape = 0;
+    // The property slot index for this shape.
+    uint16_t slot = 0xFFFF;
+    // Is this IC entry initialized?
+    bool initialized = false;
+    // For LoadGlobal/StoreGlobal: cache the direct pointer to the
+    // property slot in the global object's properties array. This
+    // eliminates the shape compare + array index on every access.
+    // Set on first IC hit, valid as long as the global shape doesn't
+    // change (which it doesn't after startup).
+    uintptr_t value_ptr = 0;
+};
+
 // FunctionInfo: per-function metadata. One per JS function (and one for
 // the top-level program). Owned by a BytecodeProgram (see below).
+//
+// LAYOUT NOTE: Fields are deliberately ordered by access frequency to
+// maximize cache-line utilization. The first 64 bytes (1 cache line)
+// contain the hottest fields: bytecode vector (accessed on every Call/
+// JumpLoop), num_registers/num_parameters/num_context_vars (PushFrame),
+// ic_entries (every property access), and hotness/deopt counters (JumpLoop).
+// Cold fields (name, source_positions, handlers, lazy_* fields) are pushed
+// to later cache lines so they don't displace hot data.
 struct FunctionInfo {
-    std::string name;       // owning std::string so string_view is stable
-    std::vector<uint8_t> bytecode;
-    std::vector<Constant> constants;
-    std::vector<std::string> property_names;  // owning strings for stable views
-    std::vector<std::string> global_names;
-    uint16_t num_parameters = 0;
-    uint16_t num_registers = 0;     // locals + temporaries
-    uint16_t num_context_vars = 0;  // captured-variable slots in this fn's Context
+    // ===== CACHE LINE 0 (hot fields, accessed on every dispatch) =====
+    std::vector<uint8_t> bytecode;          // 24 bytes — every Call/JumpLoop
+    uint16_t num_registers = 0;             //  2 bytes — PushFrame
+    uint16_t num_parameters = 0;            //  2 bytes — PushFrame
+    uint16_t num_context_vars = 0;          //  2 bytes — PushFrame/CreateContext
+    uint16_t feedback_vector_length = 0;    //  2 bytes — EnsureICCapacity (compile)
+    // 4 bytes padding to align ic_entries to 8-byte boundary
+    std::vector<ICEntry> ic_entries;        // 24 bytes — every property access
+    uint32_t hotness_counter = 0;           //  4 bytes — JumpLoop (JIT tier-up)
+    uint32_t deopt_count = 0;              //  4 bytes — JumpLoop (JIT check)
+    // ===== END CACHE LINE 0 (64 bytes) =====
+
+    // ===== CACHE LINE 1+ (moderate fields) =====
+    uintptr_t jit_code = 0;                 //  8 bytes — JumpLoop (JIT entry)
+    uintptr_t* resolved_constants = nullptr;//  8 bytes — LdaConst fast path
+    std::vector<Constant> constants;        // 24 bytes — LdaConst slow path
+    bool is_compiled = true;                //  1 byte  — CreateClosure
+
+    // ===== COLD FIELDS (rarely accessed) =====
+    std::string name;                       // 32 bytes — stack traces only
+    std::vector<std::string> property_names;// 24 bytes — IC miss only
+    std::vector<std::string> global_names;  // 24 bytes — IC miss only
+
     bool strict = false;
     bool is_async = false;
     bool is_generator = false;
     bool is_toplevel = false;       // true for the program-level FunctionInfo
-
-    // Feedback vector size (number of slots).
-    uint16_t feedback_vector_length = 0;
 
     // Source position table (compressed): for each bytecode offset, the
     // (line, column) of the source. Used for stack traces.
@@ -264,28 +305,6 @@ struct FunctionInfo {
         uint32_t column;
     };
     std::vector<SourcePosition> source_positions;
-
-    // ----- Inline cache (IC) storage -----
-    // Each feedback slot (the idx:16 operand on property access opcodes)
-    // maps to an ICEntry. The IC caches the (Shape, slot) pair from the
-    // last execution, so the fast path is a single shape-pointer compare
-    // + a single property-array load — no string comparison, no linear
-    // scan of the shape's property list.
-    struct ICEntry {
-        // The shape seen on the last execution. 0 means "uninitialized".
-        uintptr_t shape = 0;
-        // The property slot index for this shape.
-        uint16_t slot = 0xFFFF;
-        // Is this IC entry initialized?
-        bool initialized = false;
-        // For LoadGlobal/StoreGlobal: cache the direct pointer to the
-        // property slot in the global object's properties array. This
-        // eliminates the shape compare + array index on every access.
-        // Set on first IC hit, valid as long as the global shape doesn't
-        // change (which it doesn't after startup).
-        uintptr_t value_ptr = 0;
-    };
-    std::vector<ICEntry> ic_entries;
 
     // Pre-allocate the IC entries vector to feedback_vector_length. Call this
     // once at the end of compilation (after all feedback slots have been
@@ -300,7 +319,10 @@ struct FunctionInfo {
     // Get the IC entry for a feedback slot index. The vector is pre-allocated
     // by EnsureICCapacity at compile time; the bounds check remains as a
     // safety net (and is predicted not-taken after warmup).
-    ICEntry& GetIC(uint16_t idx) {
+    // Marked always_inline to eliminate the function call overhead on the
+    // property access hot path while keeping the bounds check (which helps
+    // the compiler generate better code for the large ExecuteTop function).
+    [[gnu::always_inline]] ICEntry& GetIC(uint16_t idx) {
         if (idx >= ic_entries.size()) ic_entries.resize(idx + 1);
         return ic_entries[idx];
     }
@@ -343,22 +365,19 @@ struct FunctionInfo {
     void PreResolveConstants(Isolate* iso);
 
     // ----- Lazy compilation -----
+    // (is_compiled is declared in cache line 1 above.)
     // If false, this function's bytecode has not been compiled yet. The
     // interpreter triggers compilation on first CreateClosure.
-    bool is_compiled = true;
 
     // Tier-up counter for OSR. Incremented on JumpLoop; when it crosses
     // a threshold, the interpreter triggers baseline JIT compilation.
-    uint32_t hotness_counter = 0;
-    uint32_t deopt_count = 0;  // number of times JIT code deopted
+    // (hotness_counter and deopt_count are declared in cache line 0 above.)
 
     // Pointer to the baseline JIT CodeObject (if compiled). nullptr means
     // no JIT code has been generated yet. Forward-declared — the full
     // definition is in contracts/code-object.h.
     class CodeObject;
-    // Use uintptr_t to store the pointer (avoids needing the full CodeObject
-    // definition in this header). The interpreter casts to CodeObject*.
-    uintptr_t jit_code = 0;
+    // (jit_code is declared in cache line 1 above.)
 
     // For lazy compilation: stores the AST node and scope needed to
     // compile this function on first use. Only set when is_compiled == false.
@@ -368,12 +387,7 @@ struct FunctionInfo {
     void* lazy_scope = nullptr;     // Scope*
     bool lazy_is_toplevel = false;
 
-    // Pointer to a heap-allocated array of resolved constant Values (raw
-    // tagged bits), parallel to `constants`. nullptr = not yet pre-resolved.
-    // 0 entries (kFunctionInfo) are left as 0 in the array.
-    // Placed at the very end of FunctionInfo (8 bytes) to minimize impact on
-    // hot-field cache-line alignment.
-    uintptr_t* resolved_constants = nullptr;
+    // (resolved_constants is declared in cache line 1 above.)
 };
 
 // BytecodeProgram: the result of compiling a whole source file. Owns:
