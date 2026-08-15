@@ -101,6 +101,19 @@ public:
     Shape* array_shape() const { return array_shape_; }
     Shape* function_shape() const { return function_shape_; }
 
+    // Per-kind singleton shapes (for strings, numbers, etc.).
+    // Cached here so that Shape::NewWithKind doesn't need a function-local
+    // static (which would be shared across Isolates and cause issues in
+    // the test runner).
+    Shape* kind_shape(HeapObjectKind kind) const {
+        uint8_t idx = static_cast<uint8_t>(kind);
+        return idx < kKindShapeCount ? kind_shapes_[idx] : nullptr;
+    }
+    void set_kind_shape(HeapObjectKind kind, Shape* s) {
+        uint8_t idx = static_cast<uint8_t>(kind);
+        if (idx < kKindShapeCount) kind_shapes_[idx] = s;
+    }
+
     // Allocate a new unique Shape ID.
     uint32_t NextShapeId() { return next_shape_id_++; }
 
@@ -158,6 +171,11 @@ private:
     Shape* array_shape_ = nullptr;
     Shape* function_shape_ = nullptr;
     uint32_t next_shape_id_ = 0;
+
+    // Per-kind singleton shapes, indexed by HeapObjectKind.
+    // Sized to cover all kinds (currently 8: kObject..kBoundFunction).
+    static constexpr size_t kKindShapeCount = 16;
+    Shape* kind_shapes_[kKindShapeCount] = {};
 
     JSObject* global_object_ = nullptr;
 

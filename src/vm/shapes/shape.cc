@@ -36,8 +36,19 @@ Shape* Shape::Empty(Isolate* iso) {
 }
 
 Shape* Shape::NewWithKind(Isolate* iso, HeapObjectKind kind) {
+    // Cache singleton shapes per kind, per Isolate. All strings share the
+    // same shape, all numbers share the same shape, etc. Without this cache,
+    // every JSString::New / JSNumber::New allocates a new Shape object.
+    //
+    // We use a per-Isolate cache (stored on the Isolate) rather than a
+    // function-local static, because the test runner creates multiple
+    // Isolates and sharing shapes across Isolates can cause subtle issues
+    // with shape ID spaces and transition tables.
+    Shape* cached = iso->kind_shape(kind);
+    if (cached != nullptr) return cached;
     Shape* s = new Shape(iso, iso->NextShapeId(), nullptr, {}, 0);
     s->set_object_kind(kind);
+    iso->set_kind_shape(kind, s);
     return s;
 }
 
