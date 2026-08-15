@@ -327,9 +327,12 @@ struct FunctionInfo {
     uint32_t hotness_counter = 0;
 
     // Pointer to the baseline JIT CodeObject (if compiled). nullptr means
-    // no JIT code has been generated yet.
+    // no JIT code has been generated yet. Forward-declared — the full
+    // definition is in contracts/code-object.h.
     class CodeObject;
-    CodeObject* jit_code = nullptr;
+    // Use uintptr_t to store the pointer (avoids needing the full CodeObject
+    // definition in this header). The interpreter casts to CodeObject*.
+    uintptr_t jit_code = 0;
 
     // For lazy compilation: stores the AST node and scope needed to
     // compile this function on first use. Only set when is_compiled == false.

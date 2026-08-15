@@ -35,6 +35,7 @@
 #include "base/macros.h"
 #include "frontend/bytecode/bytecode.h"
 #include "frontend/bytecode/bytecode-generator.h"
+#include "jit/baseline-jit.h"
 #include "vm/isolate/isolate.h"
 #include "vm/objects/context.h"
 #include "vm/objects/object.h"
@@ -675,10 +676,22 @@ InterpResult Interp::ExecuteTop() {
             L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
                 // OSR: increment hotness counter. When it crosses a threshold,
-                // kick off baseline JIT compilation. For now, we just count —
-                // the actual JIT compilation and tier-up will be wired in
-                // once the baseline JIT supports enough opcodes.
+                // compile the function with the baseline JIT.
                 info->hotness_counter++;
+                if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
+                                 info->jit_code == 0)) {
+                    // Compile the function with the baseline JIT.
+                    auto co = BaselineJIT::Compile(info);
+                    if (co) {
+                        info->jit_code = reinterpret_cast<uintptr_t>(co.release());
+                    }
+                }
+                // Don't execute JIT code yet — the baseline JIT currently
+                // only compiles a subset of opcodes and deopts on the rest.
+                // Executing it would cause infinite deopt loops. The JIT
+                // compilation is done (for future use / profiling), but
+                // execution stays in the interpreter until the JIT supports
+                // enough opcodes to run a full loop without deopting.
                 pc = bytecode_base + target;
                 V12_DISPATCH();
             }

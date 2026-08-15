@@ -3,42 +3,28 @@
 // =============================================================================
 // Baseline JIT compiler (Sparkplug-style).
 //
-// Walks the bytecode of a FunctionInfo and emits x86-64 machine code —
-// one machine instruction (or a short sequence) per bytecode instruction.
-// No IR, no register allocation, no inlining. The generated code uses the
-// same register file and accumulator as the interpreter, so it can be
-// entered from and exit to the interpreter at any bytecode boundary.
-//
-// Calling convention for JIT code:
-//   - RAX = accumulator (acc)
+// Compiles a FunctionInfo's bytecode into x86-64 machine code. The JIT
+// code uses the same register layout as the interpreter:
+//   - RAX = accumulator
 //   - RSI = register file base (regs[0])
-//   - RDI = pointer to the current Frame (for context, this, etc.)
-//   - R12 = Isolate* (for heap allocation, roots)
-//   - R13 = bytecode base pointer (for jump targets)
-//   - R14 = pointer to the Interp (for calling runtime functions)
-//   - R15 = pointer to the FunctionInfo (for constants, property names)
+//   - RDI = Frame* (for context, this, etc.)
+//   - R12 = Isolate*
+//   - R14 = Interp* (for calling runtime functions)
 //
-// The JIT code is entered via CodeObject::entry_point() and returns a Value
-// in RAX (same as the interpreter).
+// For each bytecode instruction, the JIT emits machine code that does the
+// same thing as the interpreter's handler. Supported opcodes are compiled
+// to native code; unsupported opcodes call back into the interpreter via
+// a fallback handler.
 //
-// What this JIT does:
-//   - LdaSmi/LdaZero/LdaConst → mov rax, immediate
-//   - Ldar/Star → mov between rax and [rsi + reg*8]
-//   - Add/Sub/Mul (Smi fast path) → inline overflow-checking arithmetic
-//   - Jump/JumpIfTrue/JumpIfFalse → jcc with patched targets
-//   - Return → ret
-//   - Everything else → call the interpreter's handler (fallback)
-//
-// The hot path (arithmetic + register moves + jumps) is fully compiled
-// to machine code. Cold paths (property access, calls, throws) fall back
-// to calling C++ runtime functions.
+// The JIT is triggered by the interpreter's OSR mechanism: when a loop's
+// hotness counter crosses a threshold, the interpreter calls
+// BaselineJIT::Compile() and then invokes the generated code.
 
 #ifndef V12_JIT_BASELINE_JIT_H_
 #define V12_JIT_BASELINE_JIT_H_
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 #include "base/macros.h"
 #include "contracts/code-object.h"
@@ -50,21 +36,11 @@ class Interp;
 
 class BaselineJIT {
 public:
-    // Compile a FunctionInfo into a CodeObject. Returns nullptr if
-    // compilation failed (e.g., unsupported opcode).
-    // The CodeObject's machine code is placed in executable memory.
-    static std::unique_ptr<CodeObject> Compile(FunctionInfo* fi, Interp* interp);
+    // Compile a FunctionInfo into a CodeObject. Returns nullptr on failure.
+    static std::unique_ptr<CodeObject> Compile(FunctionInfo* fi);
 
-    // Check if an opcode is supported by the JIT (compiled to machine code).
-    // Unsupported opcodes fall back to calling the interpreter.
-    static bool IsOpSupported(Op op);
-
-private:
-    // The JIT compiler uses a X86Emitter to emit machine code into a
-    // growable buffer, then copies it into executable memory.
-    struct CompileState;
-
-    static void CompileFunction(CompileState* cs, FunctionInfo* fi);
+    // OSR threshold: number of JumpLoop iterations before tier-up.
+    static constexpr uint32_t kOSRThreshold = 1000;
 };
 
 }  // namespace v12
