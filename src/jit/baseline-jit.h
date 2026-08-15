@@ -1,7 +1,7 @@
 // =============================================================================
 // src/jit/baseline-jit.h
 // =============================================================================
-// Baseline JIT compiler (Sparkplug-style).
+// Baseline JIT compiler (Sparkplug-style) using asmjit.
 //
 // Compiles a FunctionInfo's bytecode into x86-64 machine code. The JIT
 // code uses the same register layout as the interpreter:
@@ -9,16 +9,12 @@
 //   - RSI = register file base (regs[0])
 //   - RDI = Frame* (for context, this, etc.)
 //   - R12 = Isolate*
-//   - R14 = Interp* (for calling runtime functions)
 //
-// For each bytecode instruction, the JIT emits machine code that does the
-// same thing as the interpreter's handler. Supported opcodes are compiled
-// to native code; unsupported opcodes call back into the interpreter via
-// a fallback handler.
+// Supported opcodes are compiled to native code with inline Smi fast
+// paths. Unsupported opcodes call back into C++ runtime handlers.
 //
-// The JIT is triggered by the interpreter's OSR mechanism: when a loop's
-// hotness counter crosses a threshold, the interpreter calls
-// BaselineJIT::Compile() and then invokes the generated code.
+// asmjit handles all instruction encoding, register allocation, and
+// label management — no hand-rolled x86 encoding.
 
 #ifndef V12_JIT_BASELINE_JIT_H_
 #define V12_JIT_BASELINE_JIT_H_
@@ -40,7 +36,7 @@ public:
     static std::unique_ptr<CodeObject> Compile(FunctionInfo* fi);
 
     // OSR threshold: number of JumpLoop iterations before tier-up.
-    static constexpr uint32_t kOSRThreshold = 1000;
+    static constexpr uint32_t kOSRThreshold = 500;
 };
 
 }  // namespace v12

@@ -22,7 +22,7 @@ TOOLS_DIR="${V12_ROOT}/tools"
 MODE="${1:-debug}"
 
 CXX=g++
-CXXFLAGS_COMMON="-std=c++20 -I${SRC_DIR} -I${V12_ROOT} -Wall -Wextra -Wpedantic -Wno-unused-parameter -fno-omit-frame-pointer -g3"
+CXXFLAGS_COMMON="-std=c++20 -I${SRC_DIR} -I${V12_ROOT} -I${V12_ROOT}/third_party/asmjit -DASMJIT_STATIC -DASMJIT_NO_FORMATTING -DASMJIT_NO_LOGGING -Wall -Wextra -Wpedantic -Wno-unused-parameter -fno-omit-frame-pointer -g3"
 
 case "$MODE" in
     debug)
@@ -75,14 +75,29 @@ esac
 
 mkdir -p "${BUILD_DIR}/obj" "${BUILD_DIR}/bin"
 
-# Find all .cc source files in src/.
+# Find all .cc source files in src/ and asmjit .cpp files.
 SRCS=$(find "${SRC_DIR}" -name "*.cc" -o -name "*.cpp" | sort)
+ASMJIT_SRCS=$(find "${V12_ROOT}/third_party/asmjit/asmjit/core" -name "*.cpp" | sort)
+ASMJIT_SRCS="${ASMJIT_SRCS} $(find "${V12_ROOT}/third_party/asmjit/asmjit/x86" -name "*.cpp" | sort)"
+ASMJIT_SRCS="${ASMJIT_SRCS} $(find "${V12_ROOT}/third_party/asmjit/asmjit/support" -name "*.cpp" | sort)"
 
 echo "==> Compiling V12 library (${MODE})..."
 OBJ_FILES=""
 for src in $SRCS; do
     rel="${src#${SRC_DIR}/}"
     obj="${BUILD_DIR}/obj/${rel%.cc}.o"
+    mkdir -p "$(dirname "$obj")"
+    if [ "${src}" -nt "${obj}" ] || [ ! -f "${obj}" ]; then
+        echo "  CC  ${rel}"
+        ${CXX} ${CXXFLAGS} -c "${src}" -o "${obj}" || exit 1
+    fi
+    OBJ_FILES="${OBJ_FILES} ${obj}"
+done
+
+# Compile asmjit sources.
+for src in $ASMJIT_SRCS; do
+    rel="asmjit/$(basename "${src}")"
+    obj="${BUILD_DIR}/obj/${rel%.cpp}.o"
     mkdir -p "$(dirname "$obj")"
     if [ "${src}" -nt "${obj}" ] || [ ! -f "${obj}" ]; then
         echo "  CC  ${rel}"

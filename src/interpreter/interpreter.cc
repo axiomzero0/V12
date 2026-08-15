@@ -44,6 +44,11 @@
 
 namespace v12 {
 
+// Global deopt flag. JIT code writes to this when it needs to deopt.
+// 0 = no deopt, nonzero = deopt at bytecode offset (flag-1).
+// 0xDEAD = generic deopt (resume from JumpLoop target).
+uintptr_t g_jit_deopt_flag = 0;
+
 // -----------------------------------------------------------------------------
 // Construction / destruction
 // -----------------------------------------------------------------------------
@@ -676,22 +681,49 @@ InterpResult Interp::ExecuteTop() {
             L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
                 // OSR: increment hotness counter. When it crosses a threshold,
-                // compile the function with the baseline JIT.
+                // compile the function with the baseline JIT and execute it.
                 info->hotness_counter++;
                 if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
                                  info->jit_code == 0)) {
-                    // Compile the function with the baseline JIT.
                     auto co = BaselineJIT::Compile(info);
                     if (co) {
                         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                     }
                 }
-                // Don't execute JIT code yet — the baseline JIT currently
-                // only compiles a subset of opcodes and deopts on the rest.
-                // Executing it would cause infinite deopt loops. The JIT
-                // compilation is done (for future use / profiling), but
-                // execution stays in the interpreter until the JIT supports
-                // enough opcodes to run a full loop without deopting.
+                // If JIT code is available, execute it.
+                if (V12_UNLIKELY(info->jit_code != 0)) {
+                    auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
+                    // JIT entry: (RAX=acc, RSI=regs, RDI=frame, R12=iso)
+                    // Returns: RAX = acc value
+                    // Deopt flag is in a global variable.
+                    typedef Value (*JitEntry)(Value acc, Value* regs, void* frame,
+                                             Isolate* iso, uintptr_t* deopt_flag);
+                    auto entry = reinterpret_cast<JitEntry>(co->entry_point());
+                    g_jit_deopt_flag = 0;
+                    Value result = entry(acc, regs, frame, iso_, &g_jit_deopt_flag);
+                    if (g_jit_deopt_flag != 0) {
+                        uint32_t resume_pc = (g_jit_deopt_flag == 0xDEAD)
+                            ? target
+                            : static_cast<uint32_t>(g_jit_deopt_flag - 1);
+                        pc = bytecode_base + resume_pc;
+                        acc = result;
+                        V12_DISPATCH();
+                    }
+                    acc = result;
+                    if (frames_.size() > 1) {
+                        PopFrame();
+                        frame = &frames_.back();
+                        regs = frame->regs;
+                        ctx = frame->context;
+                        info = frame->info;
+                        bytecode_base = info->bytecode.data();
+                        pc = frame->pc;
+                    } else {
+                        frame->pc = pc;
+                        return {InterpStatus::kReturned, acc};
+                    }
+                    V12_DISPATCH();
+                }
                 pc = bytecode_base + target;
                 V12_DISPATCH();
             }
