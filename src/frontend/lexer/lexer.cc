@@ -497,6 +497,8 @@ Token Lexer::ScanPunctuation() {
                 return make(TokenKind::kNotEq, 2);
             }
             return make(TokenKind::kNot, 1);
+        case '`':
+            return make(TokenKind::kBacktick, 1);
         default:
             return MakeError(std::string("unexpected character '") + c + "'");
     }

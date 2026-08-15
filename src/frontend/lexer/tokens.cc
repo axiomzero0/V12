@@ -28,6 +28,7 @@ const char* TokenKindName(TokenKind kind) {
         case TokenKind::kQuestion:      return "?";
         case TokenKind::kNullCoalesce:  return "??";
         case TokenKind::kOptChain:      return "?.";
+        case TokenKind::kBacktick:      return "`";
         case TokenKind::kAssign:        return "=";
         case TokenKind::kAddAssign:     return "+=";
         case TokenKind::kSubAssign:     return "-=";

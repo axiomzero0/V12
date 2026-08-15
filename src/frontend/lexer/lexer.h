@@ -76,6 +76,12 @@ public:
 
     // Source access for error messages.
     std::string_view source() const { return source_; }
+    size_t pos() const { return pos_; }
+    void set_pos(size_t p) {
+        pos_ = p;
+        lookahead_count_ = 0;  // invalidate lookahead
+        lookahead_pos_ = 0;
+    }
 
     // Error state. If has_error() is true, the lexer will keep producing
     // kError tokens until EOF.

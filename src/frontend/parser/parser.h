@@ -146,6 +146,7 @@ private:
     Expr* ParseArrowFunction(SmallVector<Parameter, 4>&& params, const Token& start_tok);
     Expr* ParseArrayLiteral(const Token& start_tok);
     Expr* ParseObjectLiteral(const Token& start_tok);
+    Expr* ParseTemplateLiteral(const Token& start_tok);
 
     // Parameters
     void ParseParameterList(SmallVector<Parameter, 4>* params, TokenKind end_token);

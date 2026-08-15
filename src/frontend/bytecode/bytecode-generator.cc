@@ -900,7 +900,43 @@ void BytecodeGenerator::EmitStmt(FnState* fs, Stmt* s) {
             fs->loops.pop_back();
             break;
         }
-        case AstKind::kSwitch:
+        case AstKind::kSwitch: {
+            Switch* sw = static_cast<Switch*>(s);
+            EmitExpr(fs, sw->discriminant);
+            uint8_t disc_tmp = AllocTemp(fs);
+            EmitOp(fs, Op::Star);
+            EmitReg(fs, disc_tmp);
+            std::vector<uint32_t> case_jumps;
+            for (auto& c : sw->cases) {
+                if (c.test) {
+                    EmitExpr(fs, c.test);
+                    uint8_t test_tmp = AllocTemp(fs);
+                    EmitOp(fs, Op::Star);
+                    EmitReg(fs, test_tmp);
+                    EmitOp(fs, Op::Ldar);
+                    EmitReg(fs, disc_tmp);
+                    EmitOp(fs, Op::TestEqStrict);
+                    EmitReg(fs, test_tmp);
+                    EmitIdx(fs, AllocFeedbackSlot(fs));
+                } else {
+                    EmitOp(fs, Op::LdaTrue);
+                }
+                uint32_t jmp = EmitJump(fs, Op::JumpIfTrue);
+                case_jumps.push_back(jmp);
+            }
+            uint32_t jmp_end = EmitJump(fs, Op::Jump);
+            // Push a "loop" context for break.
+            fs->loops.push_back({{}, {}, 0});
+            for (size_t ci = 0; ci < sw->cases.size(); ++ci) {
+                PatchJump(fs, case_jumps[ci], Here(fs));
+                EmitStmt(fs, sw->cases[ci].body);
+            }
+            uint32_t end = Here(fs);
+            PatchJump(fs, jmp_end, end);
+            for (uint32_t b : fs->loops.back().breaks) PatchJump(fs, b, end);
+            fs->loops.pop_back();
+            break;
+        }
         case AstKind::kLabeled:
             // Not yet implemented; emit a nop.
             EmitOp(fs, Op::Nop);
@@ -1414,10 +1450,56 @@ void BytecodeGenerator::EmitExpr(FnState* fs, Expr* e) {
         }
         case AstKind::kClassExpr:
         case AstKind::kOptionalChain:
+        case AstKind::kTemplateLiteral: {
+            TemplateLiteral* tl = static_cast<TemplateLiteral*>(e);
+            // Load the first string part.
+            uint32_t idx = AddConstString(fs, tl->strings[0]);
+            EmitOp(fs, Op::LdaConst);
+            EmitImm32(fs, idx);
+            // For each expression: concat string + ToString(expr).
+            for (size_t j = 0; j < tl->expressions.size(); ++j) {
+                // Spill current result (the accumulated string).
+                uint8_t str_tmp = AllocTemp(fs);
+                EmitOp(fs, Op::Star);
+                EmitReg(fs, str_tmp);
+                // Evaluate the expression.
+                EmitExpr(fs, tl->expressions[j]);
+                // Spill the expression result.
+                uint8_t expr_tmp = AllocTemp(fs);
+                EmitOp(fs, Op::Star);
+                EmitReg(fs, expr_tmp);
+                // Load the accumulated string into acc.
+                EmitOp(fs, Op::Ldar);
+                EmitReg(fs, str_tmp);
+                // Add (string + expr) — the Add runtime handles string concat.
+                EmitOp(fs, Op::Add);
+                EmitReg(fs, expr_tmp);
+                EmitIdx(fs, AllocFeedbackSlot(fs));
+                // Now add the next string part.
+                if (j + 1 < tl->strings.size()) {
+                    uint8_t result_tmp = AllocTemp(fs);
+                    EmitOp(fs, Op::Star);
+                    EmitReg(fs, result_tmp);
+                    uint32_t sidx = AddConstString(fs, tl->strings[j + 1]);
+                    EmitOp(fs, Op::LdaConst);
+                    EmitImm32(fs, sidx);
+                    // Spill the string.
+                    uint8_t s_tmp = AllocTemp(fs);
+                    EmitOp(fs, Op::Star);
+                    EmitReg(fs, s_tmp);
+                    // Load the accumulated result.
+                    EmitOp(fs, Op::Ldar);
+                    EmitReg(fs, result_tmp);
+                    EmitOp(fs, Op::Add);
+                    EmitReg(fs, s_tmp);
+                    EmitIdx(fs, AllocFeedbackSlot(fs));
+                }
+            }
+            return;
+        }
         case AstKind::kSpread:
         case AstKind::kYield:
         case AstKind::kSuper:
-            // Not yet implemented.
             EmitOp(fs, Op::LdaUndefined);
             return;
         default:

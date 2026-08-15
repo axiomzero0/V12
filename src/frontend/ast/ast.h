@@ -321,6 +321,16 @@ struct Yield : public Expr {
         : Expr(AstKind::kYield, r), value(v), is_delegate(deleg) {}
 };
 
+// TemplateLiteral: `text ${expr} more text`
+// Stored as alternating string parts and expression parts.
+struct TemplateLiteral : public Expr {
+    // strings[i] is the text before expressions[i].
+    // strings.back() is the text after the last expression.
+    SmallVector<std::string_view, 2> strings;
+    SmallVector<Expr*, 2> expressions;
+    explicit TemplateLiteral(SourceRange r) : Expr(AstKind::kTemplateLiteral, r) {}
+};
+
 // ============================================================================
 // Statements
 // ============================================================================

@@ -50,6 +50,7 @@ enum class TokenKind : uint8_t {
     kQuestion,      // ?
     kNullCoalesce,  // ??
     kOptChain,      // ?.
+    kBacktick,      // `
 
     // Operators - assignment
     kAssign,        // =
