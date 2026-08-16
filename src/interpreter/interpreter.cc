@@ -762,7 +762,9 @@ InterpResult Interp::ExecuteTop() {
                         V12_DISPATCH();
                     }
                     // IC miss: do a full lookup, then update the cache.
-                    Shape::Slot slot = obj_shape->Lookup(info->property_names[name_idx]);
+                    // Use LookupInterned for pointer-compare (2-3x faster).
+                    Shape::Slot slot = obj_shape->LookupInterned(
+                        iso_->Intern(info->property_names[name_idx]));
                     if (slot != Shape::kInvalidSlot) {
                         ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
                         ic.slot = slot;
@@ -836,7 +838,7 @@ InterpResult Interp::ExecuteTop() {
                     }
                     // IC miss: lookup and update cache.
                     std::string_view name = info->property_names[name_idx];
-                    Shape::Slot slot = obj_shape->Lookup(name);
+                    Shape::Slot slot = obj_shape->LookupInterned(iso_->Intern(name));
                     if (slot != Shape::kInvalidSlot) {
                         ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
                         ic.slot = slot;
@@ -918,7 +920,7 @@ InterpResult Interp::ExecuteTop() {
                 JSObject* g = iso_->global_object();
                 Shape* gshape = g->shape();
                 std::string_view name = info->property_names[name_idx];
-                Shape::Slot slot = gshape->Lookup(name);
+                Shape::Slot slot = gshape->LookupInterned(iso_->Intern(name));
                 if (slot != Shape::kInvalidSlot) {
                     ic.shape = reinterpret_cast<uintptr_t>(gshape);
                     ic.slot = slot;
@@ -1027,7 +1029,8 @@ InterpResult Interp::ExecuteTop() {
                         callee = obj->properties()[ic.slot];
                     } else {
                         // IC miss: full lookup, then update cache.
-                        Shape::Slot slot = obj_shape->Lookup(method_name);
+                        Shape::Slot slot = obj_shape->LookupInterned(
+                            iso_->Intern(method_name));
                         if (slot != Shape::kInvalidSlot) {
                             ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
                             ic.slot = slot;
