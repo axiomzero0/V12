@@ -238,11 +238,9 @@ struct Constant {
 };
 
 // ----- Inline cache (IC) storage -----
-// Each feedback slot (the idx:16 operand on property access opcodes)
-// maps to an ICEntry. The IC caches the (Shape, slot) pair from the
-// last execution, so the fast path is a single shape-pointer compare
-// + a single property-array load — no string comparison, no linear
-// scan of the shape's property list.
+// Each feedback slot (the idx:16 operand on property access AND arithmetic
+// opcodes) maps to an ICEntry. For property access, the IC caches the
+// (Shape, slot) pair. For arithmetic, the IC caches the type seen.
 struct ICEntry {
     // The shape seen on the last execution. 0 means "uninitialized".
     uintptr_t shape = 0;
@@ -256,6 +254,17 @@ struct ICEntry {
     // Set on first IC hit, valid as long as the global shape doesn't
     // change (which it doesn't after startup).
     uintptr_t value_ptr = 0;
+
+    // ----- Type feedback for arithmetic opcodes -----
+    // Records the type seen on the last execution of Add/Sub/Mul/Div.
+    // The baseline JIT reads this to emit a single type guard instead
+    // of assuming Smi and deopting on the first non-Smi.
+    //   0 = uninitialized (no feedback yet)
+    //   1 = Smi (both operands Smi, no overflow)
+    //   2 = Number (HeapNumber or Smi overflow)
+    //   3 = String (string concatenation)
+    //   4 = Other (boolean, object, etc.)
+    uint8_t type_feedback = 0;
 };
 
 // FunctionInfo: per-function metadata. One per JS function (and one for

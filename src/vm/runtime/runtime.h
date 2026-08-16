@@ -107,6 +107,28 @@ uint32_t ToUint32(Isolate* iso, Value v);
 // Box a double into either a Smi (if it fits) or a HeapNumber.
 Value FromDouble(Isolate* iso, double d);
 
+// ----- Type feedback for arithmetic operations -----
+// Records the type seen at a binary operation site. Used by the JIT to
+// emit a single type guard instead of assuming Smi and deopting.
+enum class TypeFeedback : uint8_t {
+    kUninit   = 0,  // no feedback yet
+    kSmi      = 1,  // both operands Smi, no overflow
+    kNumber   = 2,  // HeapNumber or Smi overflow
+    kString   = 3,  // string concatenation
+    kOther    = 4,  // boolean, object, etc.
+};
+
+// Record type feedback for a binary operation given the two operands.
+// Called by the interpreter's Add/Sub/Mul/Div handlers after executing
+// the operation. Writes the feedback into the ICEntry's type_feedback field.
+inline TypeFeedback ClassifyBinaryOp(Value a, Value b) {
+    if (a.IsSmi() && b.IsSmi()) return TypeFeedback::kSmi;
+    if ((a.IsSmi() || a.IsNumber()) && (b.IsSmi() || b.IsNumber()))
+        return TypeFeedback::kNumber;
+    if (a.IsString() || b.IsString()) return TypeFeedback::kString;
+    return TypeFeedback::kOther;
+}
+
 // ----- Inline Smi fast paths for the interpreter -----
 // These handle the common case where both operands are Smis and the result
 // fits in a Smi. They return true if they handled the operation (with the

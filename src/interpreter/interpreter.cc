@@ -280,50 +280,68 @@ InterpResult Interp::ExecuteTop() {
             // ----- Binary arithmetic -----
             // Format: op  r:8  idx:16   ->   acc = acc <op> regs[r]
             // Hot path: try Smi fast path first, fall back to slow path.
+            // Type feedback is ONLY recorded on the slow path (non-Smi) to
+            // avoid overhead on the common Smi case. The JIT reads the
+            // feedback to decide what code to emit: if type_feedback == 0
+            // (uninit), it assumes Smi (the common case). If kNumber, it
+            // emits Number code. If kString, it deopts.
             L_Add: {
                 uint8_t r = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                Value lhs = acc, rhs = regs[r];
                 Value result;
-                if (V12_LIKELY(TrySmiAdd(acc, regs[r], &result))) {
+                if (V12_LIKELY(TrySmiAdd(lhs, rhs, &result))) {
                     acc = result;
                 } else {
-                    acc = Add(iso_, acc, regs[r]);
+                    acc = Add(iso_, lhs, rhs);
+                    // Record type feedback only on slow path.
+                    info->GetIC(ic_slot).type_feedback =
+                        static_cast<uint8_t>(ClassifyBinaryOp(lhs, rhs));
                 }
                 V12_DISPATCH();
             }
             L_Sub: {
                 uint8_t r = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                Value lhs = acc, rhs = regs[r];
                 Value result;
-                if (V12_LIKELY(TrySmiSub(acc, regs[r], &result))) {
+                if (V12_LIKELY(TrySmiSub(lhs, rhs, &result))) {
                     acc = result;
                 } else {
-                    acc = Sub(iso_, acc, regs[r]);
+                    acc = Sub(iso_, lhs, rhs);
+                    info->GetIC(ic_slot).type_feedback =
+                        static_cast<uint8_t>(ClassifyBinaryOp(lhs, rhs));
                 }
                 V12_DISPATCH();
             }
             L_Mul: {
                 uint8_t r = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                Value lhs = acc, rhs = regs[r];
                 Value result;
-                if (V12_LIKELY(TrySmiMul(acc, regs[r], &result))) {
+                if (V12_LIKELY(TrySmiMul(lhs, rhs, &result))) {
                     acc = result;
                 } else {
-                    acc = Mul(iso_, acc, regs[r]);
+                    acc = Mul(iso_, lhs, rhs);
+                    info->GetIC(ic_slot).type_feedback =
+                        static_cast<uint8_t>(ClassifyBinaryOp(lhs, rhs));
                 }
                 V12_DISPATCH();
             }
             L_Div: {
                 uint8_t r = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
+                Value lhs = acc, rhs = regs[r];
                 // Smi fast path: if both Smis and divides evenly, skip
                 // heap allocation. Falls back to slow path for non-integer
                 // results (e.g. 7/2=3.5) or division by zero.
                 Value result;
-                if (V12_LIKELY(TrySmiDiv(acc, regs[r], &result))) {
+                if (V12_LIKELY(TrySmiDiv(lhs, rhs, &result))) {
                     acc = result;
                 } else {
-                    acc = Div(iso_, acc, regs[r]);
+                    acc = Div(iso_, lhs, rhs);
+                    info->GetIC(ic_slot).type_feedback =
+                        static_cast<uint8_t>(ClassifyBinaryOp(lhs, rhs));
                 }
                 V12_DISPATCH();
             }
