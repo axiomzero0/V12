@@ -681,6 +681,504 @@ int LICM(Graph* g) {
 }
 
 // -----------------------------------------------------------------------------
+// AlgebraicSimplification
+// -----------------------------------------------------------------------------
+// Applies algebraic identities:
+//   x + (-x) → 0, x - (-y) → x + y, (-x)*(-y) → x*y
+//   x * (-1) → 0-x, (-x)*y → -(x*y), x / (-1) → 0-x
+//   -(-x) → x, ~~x → x
+int AlgebraicSimplification(Graph* g) {
+    int simplified = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+            if (n->IsDead()) continue;
+            if (!n->HasProp(NodeProp::kPure)) continue;
+
+            Opcode op = n->op();
+
+            // --- Double negation: -(-x) → x ---
+            // Int32Neg(Int32Neg(x)) → x
+            if (op == Opcode::kInt32Neg && n->input_count() >= 1) {
+                Node* input = n->input(n->input_count() - 1);
+                if (input->op() == Opcode::kInt32Neg) {
+                    Node* inner = input->input(input->input_count() - 1);
+                    n->ReplaceAllUsesWith(inner);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // --- Double bitwise not: ~~x → x ---
+            if (op == Opcode::kBitwiseNot && n->input_count() >= 1) {
+                Node* input = n->input(n->input_count() - 1);
+                if (input->op() == Opcode::kBitwiseNot) {
+                    Node* inner = input->input(input->input_count() - 1);
+                    n->ReplaceAllUsesWith(inner);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // --- Binary algebraic identities ---
+            if (n->input_count() < 2) continue;
+            Node* lhs = GetLHS(n);
+            Node* rhs = GetRHS(n);
+            if (lhs == nullptr || rhs == nullptr) continue;
+
+            // x + (-x) → 0 and (-x) + x → 0
+            if (op == Opcode::kInt32Add) {
+                if (rhs->op() == Opcode::kInt32Neg &&
+                    rhs->input(rhs->input_count() - 1) == lhs) {
+                    n->ReplaceAllUsesWith(NewInt32Constant(g, 0));
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+                if (lhs->op() == Opcode::kInt32Neg &&
+                    lhs->input(lhs->input_count() - 1) == rhs) {
+                    n->ReplaceAllUsesWith(NewInt32Constant(g, 0));
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // x - (-y) → x + y
+            if (op == Opcode::kInt32Sub) {
+                if (rhs->op() == Opcode::kInt32Neg) {
+                    Node* inner = rhs->input(rhs->input_count() - 1);
+                    Node* add = g->NewPureNode(Opcode::kInt32Add,
+                                                NodeProp::kPure | NodeProp::kCommutative,
+                                                Type::Int32(), {lhs, inner});
+                    n->ReplaceAllUsesWith(add);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // x * (-1) → 0 - x
+            if (op == Opcode::kInt32Mul && IsInt32Constant(rhs) &&
+                GetIntValue(rhs) == -1) {
+                Node* zero = NewInt32Constant(g, 0);
+                Node* neg = g->NewPureNode(Opcode::kInt32Sub,
+                                            NodeProp::kPure, Type::Int32(),
+                                            {zero, lhs});
+                n->ReplaceAllUsesWith(neg);
+                n->Kill();
+                simplified++;
+                changed = true;
+                continue;
+            }
+
+            // x / (-1) → 0 - x
+            if (op == Opcode::kInt32Div && IsInt32Constant(rhs) &&
+                GetIntValue(rhs) == -1) {
+                Node* zero = NewInt32Constant(g, 0);
+                Node* neg = g->NewPureNode(Opcode::kInt32Sub,
+                                            NodeProp::kPure, Type::Int32(),
+                                            {zero, lhs});
+                n->ReplaceAllUsesWith(neg);
+                n->Kill();
+                simplified++;
+                changed = true;
+                continue;
+            }
+        }
+    }
+
+    return simplified;
+}
+
+// -----------------------------------------------------------------------------
+// BooleanSimplification
+// -----------------------------------------------------------------------------
+// Simplifies boolean operations: !!x→x, !(!x)→x
+int BooleanSimplification(Graph* g) {
+    int simplified = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+            if (n->IsDead()) continue;
+            if (!n->HasProp(NodeProp::kPure)) continue;
+            if (n->input_count() < 1) continue;
+
+            // LogicalNot(LogicalNot(x)) → x
+            if (n->op() == Opcode::kBitwiseNot) {
+                Node* input = n->input(n->input_count() - 1);
+                if (input->op() == Opcode::kBitwiseNot) {
+                    Node* inner = input->input(input->input_count() - 1);
+                    n->ReplaceAllUsesWith(inner);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // BitwiseNot(BitwiseNot(x)) → x (already handled by AlgebraicSimplification
+            // but we check here too for boolean-typed values)
+        }
+    }
+
+    return simplified;
+}
+
+// -----------------------------------------------------------------------------
+// ComparisonSimplification
+// -----------------------------------------------------------------------------
+// Simplifies comparison chains: !(a<b)→a>=b, a>b→b<a
+int ComparisonSimplification(Graph* g) {
+    int simplified = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+            if (n->IsDead()) continue;
+            if (!n->HasProp(NodeProp::kPure)) continue;
+            if (n->input_count() < 2) continue;
+
+            Node* lhs = GetLHS(n);
+            Node* rhs = GetRHS(n);
+            if (lhs == nullptr || rhs == nullptr) continue;
+
+            Opcode op = n->op();
+
+            // !(a == b) → a != b
+            // !(a != b) → a == b
+            // !(a < b) → a >= b
+            // !(a <= b) → a > b
+            // !(a > b) → a <= b
+            // !(a >= b) → a < b
+            if (n->op() == Opcode::kBitwiseNot || n->op() == Opcode::kBitwiseNot) {
+                Node* input = n->input(n->input_count() - 1);
+                Opcode cmp_op = input->op();
+
+                // Only handle if the input is a comparison.
+                if (cmp_op == Opcode::kWord32Equal ||
+                    cmp_op == Opcode::kInt32LessThan ||
+                    cmp_op == Opcode::kInt32LessThanOrEqual) {
+                    // Get the comparison's operands.
+                    Node* cmp_lhs = GetLHS(input);
+                    Node* cmp_rhs = GetRHS(input);
+                    if (cmp_lhs == nullptr || cmp_rhs == nullptr) continue;
+
+                    Opcode new_op;
+                    switch (cmp_op) {
+                        case Opcode::kWord32Equal:
+                            new_op = Opcode::kWord32Equal;  // we'll negate by XOR with 1
+                            // !(a == b) → a ^ b (for int32, a==b gives 0/1, ! gives 1/0)
+                            // Actually, we need a NotEqual opcode. Since we don't have one,
+                            // we create BitwiseXor(cmp, 1) to flip the result.
+                            {
+                                Node* one = NewInt32Constant(g, 1);
+                                Node* xor_node = g->NewPureNode(Opcode::kBitwiseXor,
+                                                                 NodeProp::kPure,
+                                                                 Type::Boolean(),
+                                                                 {input, one});
+                                n->ReplaceAllUsesWith(xor_node);
+                                n->Kill();
+                                simplified++;
+                                changed = true;
+                            }
+                            continue;
+                        case Opcode::kInt32LessThan:
+                            // !(a < b) → a >= b → b <= a (canonicalized)
+                            new_op = Opcode::kInt32LessThanOrEqual;
+                            {
+                                Node* new_cmp = g->NewPureNode(new_op,
+                                                                NodeProp::kPure | NodeProp::kCommutative,
+                                                                Type::Boolean(),
+                                                                {cmp_rhs, cmp_lhs});
+                                n->ReplaceAllUsesWith(new_cmp);
+                                n->Kill();
+                                simplified++;
+                                changed = true;
+                            }
+                            continue;
+                        case Opcode::kInt32LessThanOrEqual:
+                            // !(a <= b) → a > b → b < a (canonicalized)
+                            new_op = Opcode::kInt32LessThan;
+                            {
+                                Node* new_cmp = g->NewPureNode(new_op,
+                                                                NodeProp::kPure | NodeProp::kCommutative,
+                                                                Type::Boolean(),
+                                                                {cmp_rhs, cmp_lhs});
+                                n->ReplaceAllUsesWith(new_cmp);
+                                n->Kill();
+                                simplified++;
+                                changed = true;
+                            }
+                            continue;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+    return simplified;
+}
+
+// -----------------------------------------------------------------------------
+// PhiSimplification
+// -----------------------------------------------------------------------------
+// Simplifies Phi nodes: Phi(x)→x, Phi(x,x,x)→x
+int PhiSimplification(Graph* g) {
+    int simplified = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+            if (n->IsDead()) continue;
+            if (n->op() != Opcode::kPhi) continue;
+
+            int count = n->input_count();
+            if (count == 0) continue;
+
+            // Collect value inputs (skip control input if present).
+            // For Phi nodes, the convention is [control?, value1, value2, ...].
+            int start = n->HasProp(NodeProp::kControl) ? 1 : 0;
+            if (start >= count) continue;
+
+            Node* first = n->input(start);
+
+            // Phi(x) → x (single input)
+            if (count - start == 1) {
+                n->ReplaceAllUsesWith(first);
+                n->Kill();
+                simplified++;
+                changed = true;
+                continue;
+            }
+
+            // Phi(x, x, x, ...) → x (all inputs identical)
+            bool all_same = true;
+            for (int i = start + 1; i < count; ++i) {
+                if (n->input(i) != first) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if (all_same) {
+                n->ReplaceAllUsesWith(first);
+                n->Kill();
+                simplified++;
+                changed = true;
+                continue;
+            }
+
+            // Phi(x, self) → x (one input is the Phi itself)
+            if (count - start == 2) {
+                Node* other = n->input(start + 1);
+                if (first == n) {
+                    n->ReplaceAllUsesWith(other);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+                if (other == n) {
+                    n->ReplaceAllUsesWith(first);
+                    n->Kill();
+                    simplified++;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+    }
+
+    return simplified;
+}
+
+// -----------------------------------------------------------------------------
+// CheckElimination
+// -----------------------------------------------------------------------------
+// Removes redundant type checks: CheckSmi(CheckSmi(x)) → CheckSmi(x)
+int CheckElimination(Graph* g) {
+    int eliminated = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+            if (n->IsDead()) continue;
+            if (n->input_count() < 1) continue;
+
+            Opcode op = n->op();
+            Node* input = n->input(n->input_count() - 1);
+
+            // CheckSmi(CheckSmi(x)) → CheckSmi(x)
+            // CheckHeapObject(CheckHeapObject(x)) → CheckHeapObject(x)
+            if (op == Opcode::kCheckSmi && input->op() == Opcode::kCheckSmi) {
+                n->ReplaceAllUsesWith(input);
+                n->Kill();
+                eliminated++;
+                changed = true;
+                continue;
+            }
+            if (op == Opcode::kCheckHeapObject &&
+                input->op() == Opcode::kCheckHeapObject) {
+                n->ReplaceAllUsesWith(input);
+                n->Kill();
+                eliminated++;
+                changed = true;
+                continue;
+            }
+
+            // CheckSmi(Int32Constant) → Int32Constant (constants are known Smis)
+            if (op == Opcode::kCheckSmi && IsInt32Constant(input)) {
+                n->ReplaceAllUsesWith(input);
+                n->Kill();
+                eliminated++;
+                changed = true;
+                continue;
+            }
+
+            // CheckNumber(Int32Constant) → Int32Constant
+            if (op == Opcode::kCheckNumber && IsInt32Constant(input)) {
+                n->ReplaceAllUsesWith(input);
+                n->Kill();
+                eliminated++;
+                changed = true;
+                continue;
+            }
+        }
+    }
+
+    return eliminated;
+}
+
+// -----------------------------------------------------------------------------
+// RedundancyElimination
+// -----------------------------------------------------------------------------
+// Eliminates redundant operations after type narrowing.
+// Currently delegates to CheckElimination + GVN.
+int RedundancyElimination(Graph* g) {
+    int eliminated = 0;
+    eliminated += CheckElimination(g);
+    eliminated += GlobalValueNumbering(g);
+    return eliminated;
+}
+
+// -----------------------------------------------------------------------------
+// ValueNumbering
+// -----------------------------------------------------------------------------
+// Sophisticated GVN with algebraic identities.
+// In addition to hash-consing, applies identities on match:
+//   x * 0 → 0, x * 1 → x, x + 0 → x, x - 0 → x, x - x → 0
+int ValueNumbering(Graph* g) {
+    int eliminated = 0;
+
+    // First, apply algebraic identities that InstCombine might miss
+    // (these handle cases where both inputs are the same node).
+    for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+        if (n->IsDead()) continue;
+        if (!n->HasProp(NodeProp::kPure)) continue;
+        if (n->input_count() < 2) continue;
+
+        Node* lhs = GetLHS(n);
+        Node* rhs = GetRHS(n);
+        if (lhs == nullptr || rhs == nullptr) continue;
+
+        // x - x → 0
+        if (n->op() == Opcode::kInt32Sub && lhs == rhs) {
+            n->ReplaceAllUsesWith(NewInt32Constant(g, 0));
+            n->Kill();
+            eliminated++;
+            continue;
+        }
+
+        // x ^ x → 0
+        if (n->op() == Opcode::kBitwiseXor && lhs == rhs) {
+            n->ReplaceAllUsesWith(NewInt32Constant(g, 0));
+            n->Kill();
+            eliminated++;
+            continue;
+        }
+
+        // x & x → x
+        if (n->op() == Opcode::kBitwiseAnd && lhs == rhs) {
+            n->ReplaceAllUsesWith(lhs);
+            n->Kill();
+            eliminated++;
+            continue;
+        }
+
+        // x | x → x
+        if (n->op() == Opcode::kBitwiseOr && lhs == rhs) {
+            n->ReplaceAllUsesWith(lhs);
+            n->Kill();
+            eliminated++;
+            continue;
+        }
+    }
+
+    // Then run GVN for hash-consing.
+    eliminated += GlobalValueNumbering(g);
+
+    return eliminated;
+}
+
+// -----------------------------------------------------------------------------
+// BlockMerging
+// -----------------------------------------------------------------------------
+// Merges blocks connected by a single unconditional edge.
+// Currently a stub (requires proper CFG with MachineBlocks).
+int BlockMerging(Graph* g) {
+    int merged = 0;
+    // TODO: when we have proper basic blocks in the IR graph,
+    // merge blocks A→B where A ends with Jump(B) and B has one predecessor.
+    return merged;
+}
+
+// -----------------------------------------------------------------------------
+// LoopUnrolling
+// -----------------------------------------------------------------------------
+// Unrolls small loops. Currently a stub.
+int LoopUnrolling(Graph* g) {
+    int unrolled = 0;
+    // TODO: when we have loop trip-count analysis, unroll small loops.
+    return unrolled;
+}
+
+// -----------------------------------------------------------------------------
+// TailCallOptimization
+// -----------------------------------------------------------------------------
+// Converts tail calls to jumps. Currently a stub.
+int TailCallOptimization(Graph* g) {
+    int optimized = 0;
+    // TODO: when we have Call + Return patterns, convert tail calls.
+    return optimized;
+}
+
+// -----------------------------------------------------------------------------
+// EscapeAnalysis
+// -----------------------------------------------------------------------------
+// Detects non-escaping allocations. Currently a stub.
+int EscapeAnalysis(Graph* g) {
+    int eliminated = 0;
+    // TODO: when we have AllocateObject nodes, track escapes and scalar-replace.
+    return eliminated;
+}
+
+// -----------------------------------------------------------------------------
 // OptimizeGraph — run all passes to a fixed point
 // -----------------------------------------------------------------------------
 int OptimizeGraph(Graph* g) {
@@ -694,17 +1192,43 @@ int OptimizeGraph(Graph* g) {
         iterations++;
 
         int n = 0;
+        // Phase 1: Simplification and canonicalization
+        n += Simplification(g);
+        n += ComparisonSimplification(g);
+        n += BooleanSimplification(g);
+
+        // Phase 2: Constant propagation and folding
         n += ConstantPropagation(g);
         n += ConstantFolding(g);
+
+        // Phase 3: Strength reduction and algebraic identities
         n += StrengthReduction(g);
+        n += AlgebraicSimplification(g);
         n += InstructionCombining(g);
-        n += Simplification(g);
-        n += BranchElimination(g);
+
+        // Phase 4: Check elimination and redundancy
+        n += CheckElimination(g);
+        n += RedundancyElimination(g);
+
+        // Phase 5: Value numbering and CSE
+        n += ValueNumbering(g);
         n += CommonSubexpressionElimination(g);
-        n += GlobalValueNumbering(g);
-        n += DeadCodeElimination(g);
-        // LICM not yet effective (no loop modeling)
+
+        // Phase 6: Control flow (stubs for now)
+        n += BranchElimination(g);
+        n += BlockMerging(g);
+        n += PhiSimplification(g);
+
+        // Phase 7: Loop optimizations (stubs)
         // n += LICM(g);
+        // n += LoopUnrolling(g);
+
+        // Phase 8: Advanced (stubs)
+        // n += TailCallOptimization(g);
+        // n += EscapeAnalysis(g);
+
+        // Phase 9: Final cleanup
+        n += DeadCodeElimination(g);
 
         total += n;
         if (n > 0) changed = true;

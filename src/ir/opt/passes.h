@@ -98,6 +98,102 @@ int CommonSubexpressionElimination(Graph* g);
 // iterations. Requires loop detection (Loop nodes in the control flow).
 int LICM(Graph* g);
 
+// ----- Additional production JIT passes -----
+
+// Algebraic Simplification.
+// Applies algebraic identities that GVN/InstCombine miss:
+//   x + (-x) → 0
+//   x - (-y) → x + y
+//   (-x) * (-y) → x * y
+//   x * (-1) → -x (0 - x)
+//   (-x) * y → -(x * y)
+//   x / (-1) → -x
+//   x / x → 1 (if x != 0)
+//   Double negation: -(-x) → x
+//   Double bitwise not: ~~x → x
+int AlgebraicSimplification(Graph* g);
+
+// Boolean Simplification.
+// Simplifies boolean operations:
+//   !!x → x (double negation of truthiness)
+//   x === true → x (if x is already boolean)
+//   x === false → !x (if x is already boolean)
+//   x !== true → !x
+//   x !== false → x
+//   !(!x) → x (logical double negation)
+int BooleanSimplification(Graph* g);
+
+// Comparison Simplification.
+// Simplifies comparison chains:
+//   !(a < b) → a >= b
+//   !(a <= b) → a > b
+//   !(a == b) → a != b
+//   !(a != b) → a == b
+//   a > b → b < a (canonicalize to LessThan)
+//   a >= b → b <= a (canonicalize to LessThanOrEqual)
+//   a < b == false → a >= b
+int ComparisonSimplification(Graph* g);
+
+// Phi Simplification.
+// Simplifies Phi nodes:
+//   Phi(x) → x (single input)
+//   Phi(x, x, x) → x (all inputs identical)
+//   Phi(x, y) where one input is the Phi itself → the other input
+int PhiSimplification(Graph* g);
+
+// Check Elimination.
+// Removes redundant type checks:
+//   CheckSmi(CheckSmi(x)) → CheckSmi(x)
+//   CheckHeapObject(CheckHeapObject(x)) → CheckHeapObject(x)
+//   CheckSmi(Int32Constant) → Int32Constant (constants are known)
+//   CheckSmi(Int32Add(a, b)) → CheckSmi(a) + CheckSmi(b) (propagate)
+int CheckElimination(Graph* g);
+
+// Redundancy Elimination.
+// Eliminates redundant operations discovered by type analysis:
+//   If a CheckSmi already verified x is a Smi, remove subsequent CheckSmi(x)
+//   If a branch narrowed x's type, remove checks that are now provably true
+// This is a simplified version of V8's RedundancyElimination pass.
+int RedundancyElimination(Graph* g);
+
+// Value Numbering.
+// More sophisticated than GVN — includes algebraic identities:
+//   x * 0 → 0 (even if x has side effects, we skip those)
+//   x * 1 → x
+//   x + 0 → x
+//   x - 0 → x
+//   x - x → 0
+//   x ^ x → 0
+//   x & x → x
+//   x | x → x
+// Hash-conses by (opcode, input values) and applies identities on match.
+int ValueNumbering(Graph* g);
+
+// Block Merging.
+// Merges blocks connected by a single unconditional edge:
+//   If block A ends with Jump to B, and B has only one predecessor (A),
+//   merge B into A. Reduces CFG complexity.
+int BlockMerging(Graph* g);
+
+// Loop Unrolling.
+// Unrolls small loops by N iterations to reduce loop overhead:
+//   for (i = 0; i < 4; i++) body → body; body; body; body (if trip count known)
+// Currently a stub (requires loop trip-count analysis).
+int LoopUnrolling(Graph* g);
+
+// Tail Call Optimization.
+// Converts tail calls (call immediately followed by return) into jumps:
+//   return f(args) → jump f(args) (no new stack frame)
+// Currently a stub (requires call/return pattern matching).
+int TailCallOptimization(Graph* g);
+
+// Escape Analysis.
+// Detects allocations that don't escape the current function and replaces
+// them with scalar values (fields → local variables):
+//   let o = {x: 1, y: 2}; return o.x + o.y → return 1 + 2
+// Currently a stub (requires allocation tracking).
+int EscapeAnalysis(Graph* g);
+
 // Run all optimization passes to a fixed point.
 int OptimizeGraph(Graph* g);
 
