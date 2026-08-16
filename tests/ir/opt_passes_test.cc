@@ -252,16 +252,25 @@ TEST(OptPasses, InstructionCombiningShiftByZero) {
 TEST(OptPasses, GVNDeduplicates) {
     Isolate iso;
     Arena arena;
-    // GVN deduplicates nodes with the same opcode AND same input node ids.
-    // Since each Ldar creates a separate node, "x + 1; x + 1" produces
-    // two Adds with different input nodes. GVN only deduplicates when
-    // the exact same input nodes are used. We test that GVN doesn't crash
-    // and returns a non-negative count.
+    // With the fixed builder (pure nodes have no control input), two
+    // identical "x + 1" expressions share the same input nodes (x and 1),
+    // so GVN should deduplicate them.
     Graph* g = BuildGraph(&iso, &arena, "let x = 5; let a = x + 1; let b = x + 1;");
     { EXPECT_NE(g, (void*)nullptr); if (!g) return; }
 
+    int before = CountOpcode(g, Opcode::kInt32Add);
+    // Before optimization, there may be 1 or 2 Add nodes depending on
+    // whether the builder CSE'd them already.
+    EXPECT_GE(before, 1);
+
     int deduped = GlobalValueNumbering(g);
-    EXPECT_GE(deduped, 0);  // may or may not dedupe depending on node sharing
+    // GVN should deduplicate at least one if there were 2+ Adds.
+    if (before >= 2) {
+        EXPECT_GE(deduped, 1);
+    }
+
+    int after = CountOpcode(g, Opcode::kInt32Add);
+    EXPECT_LE(after, 1);  // at most one Add remains
 }
 
 // =============================================================================

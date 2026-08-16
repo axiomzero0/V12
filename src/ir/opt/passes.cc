@@ -53,20 +53,22 @@ static Node* NewFloat64Constant(Graph* g, double value) {
     return n;
 }
 
-// Helper: get the two value inputs of a binary op (skipping control input).
-// For pure nodes built by our builder, input[0] is control, input[1] is lhs,
-// input[2] is rhs. For pure nodes without control, input[0] is lhs, input[1] is rhs.
+// Helper: get the two value inputs of a binary op.
+// For pure nodes (no control/effect), inputs are just [lhs, rhs].
+// For nodes with control, the first input is control.
 static Node* GetLHS(Node* n) {
     int count = n->input_count();
     if (count < 2) return nullptr;
-    // If the node has kControl, input[0] is control and inputs[1..] are values.
-    // Otherwise, all inputs are values.
-    // But our builder passes control_ even for pure nodes (design issue).
-    // We handle both: if input[0] is a Start/Merge/Loop/Branch node, skip it.
-    Node* first = n->input(0);
-    if (first->HasProp(NodeProp::kControl) || first->op() == Opcode::kStart) {
+    // Pure nodes: no control input, so input[0] is lhs.
+    // Non-pure nodes: input[0] is control, input[1] is lhs (or effect).
+    if (n->HasProp(NodeProp::kPure)) {
         return n->input(count - 2);
     }
+    // For non-pure nodes with control, skip control (and effect if present).
+    int skip = 0;
+    if (n->HasProp(NodeProp::kControl)) skip++;
+    if (n->HasProp(NodeProp::kEffect)) skip++;
+    if (count - skip < 2) return nullptr;
     return n->input(count - 2);
 }
 
@@ -217,13 +219,37 @@ struct GVNKeyHash {
 
 int GlobalValueNumbering(Graph* g) {
     int deduped = 0;
+
+    // First, deduplicate Int32Constant nodes by value.
+    // This is important because the builder creates a new constant node
+    // for each literal, even if the value is the same.
+    std::unordered_map<int64_t, Node*> int_consts;
+    for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
+        if (n->IsDead()) continue;
+        if (n->op() != Opcode::kInt32Constant) continue;
+
+        int64_t val = n->int_value();
+        auto it = int_consts.find(val);
+        if (it != int_consts.end()) {
+            Node* existing = it->second;
+            if (existing != n && !existing->IsDead()) {
+                n->ReplaceAllUsesWith(existing);
+                n->Kill();
+                deduped++;
+            }
+        } else {
+            int_consts[val] = n;
+        }
+    }
+
+    // Then, deduplicate other pure nodes by (opcode, input_ids).
     std::unordered_map<GVNKey, Node*, GVNKeyHash> table;
 
     for (Node* n = g->first_node(); n != nullptr; n = n->next_in_graph()) {
         if (n->IsDead()) continue;
         if (!n->HasProp(NodeProp::kPure)) continue;
 
-        // Skip constants — they're deduplicated by value in ConstantFolding.
+        // Skip constants — already deduplicated above.
         if (n->op() == Opcode::kInt32Constant ||
             n->op() == Opcode::kFloat64Constant ||
             n->op() == Opcode::kConstant) {

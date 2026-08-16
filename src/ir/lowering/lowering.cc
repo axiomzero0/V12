@@ -106,6 +106,8 @@ LoweringResult LowerGraph(Graph* g, const TargetDescription* target,
 
             // ----- Int32 arithmetic -----
             case Opcode::kInt32Add: {
+                // Pure nodes: inputs are [lhs, rhs].
+                // Non-pure nodes: inputs are [control, lhs, rhs] or [control, effect, lhs, rhs].
                 int count = n->input_count();
                 Node* lhs = n->input(count - 2);
                 Node* rhs = n->input(count - 1);

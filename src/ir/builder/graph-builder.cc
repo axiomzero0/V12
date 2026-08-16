@@ -69,13 +69,15 @@ Node* GraphBuilder::NewSmiConstant(int64_t value) {
 }
 
 Node* GraphBuilder::NewInt32Binop(Opcode op, Node* lhs, Node* rhs) {
-    return graph_->NewNode2(op, NodeProp::kPure, Type::Int32(),
-                            control_, nullptr, lhs, rhs);
+    // Pure nodes don't need control/effect inputs — they float freely.
+    // This makes GVN work correctly (same inputs → same node id key).
+    return graph_->NewPureNode(op, NodeProp::kPure | NodeProp::kCommutative,
+                                Type::Int32(), {lhs, rhs});
 }
 
 Node* GraphBuilder::NewComparison(Opcode op, Node* lhs, Node* rhs) {
-    return graph_->NewNode2(op, NodeProp::kPure, Type::Boolean(),
-                            control_, nullptr, lhs, rhs);
+    return graph_->NewPureNode(op, NodeProp::kPure | NodeProp::kCommutative,
+                                Type::Boolean(), {lhs, rhs});
 }
 
 void GraphBuilder::SkipInstruction(Op op) {
