@@ -62,13 +62,10 @@ Graph* GraphBuilder::Build() {
 }
 
 Node* GraphBuilder::NewSmiConstant(int64_t value) {
-    // Create a pure Int32Constant node with no inputs.
-    // Note: the actual constant value is not stored in the node yet (the
-    // Node struct doesn't have a value field). The type carries the info
-    // that this is a Smi. When constant values are added, this will be
-    // updated to store the actual value.
-    return graph_->NewPureNode(Opcode::kInt32Constant, NodeProp::kPure,
-                               Type::Smi(), {});
+    Node* n = graph_->NewPureNode(Opcode::kInt32Constant, NodeProp::kPure,
+                                  Type::Smi(), {});
+    n->set_int_value(value);
+    return n;
 }
 
 Node* GraphBuilder::NewInt32Binop(Opcode op, Node* lhs, Node* rhs) {

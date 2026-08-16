@@ -333,6 +333,19 @@ private:
     Inputs inputs_;
     Uses uses_;
     Node* next_ = nullptr;  // intrusive list of all nodes in the graph
+
+public:
+    // Constant value storage (for Int32Constant/Float64Constant nodes).
+    // This allows optimization passes to reason about actual constant values.
+    // For non-constant nodes, these fields are unused.
+    int64_t int_value_ = 0;
+    double float_value_ = 0.0;
+
+    // Accessors for constant values.
+    int64_t int_value() const { return int_value_; }
+    void set_int_value(int64_t v) { int_value_ = v; }
+    double float_value() const { return float_value_; }
+    void set_float_value(double v) { float_value_ = v; }
 };
 
 }  // namespace v12
