@@ -188,6 +188,25 @@ inline bool TrySmiMul(Value a, Value b, Value* out) {
     return false;
 }
 
+// Try to divide two Values as Smis. Returns true if both were Smis, b != 0,
+// and a % b == 0 (i.e. the result is an exact integer that fits in a Smi).
+// Otherwise returns false (caller falls back to the slow path which may
+// produce a HeapNumber). This avoids heap allocation for the common case
+// of integer division that divides evenly.
+inline bool TrySmiDiv(Value a, Value b, Value* out) {
+    if (V12_LIKELY(a.IsSmi() && b.IsSmi())) {
+        intptr_t x = a.AsSmi();
+        intptr_t y = b.AsSmi();
+        if (V12_UNLIKELY(y == 0)) return false;  // division by zero → slow path (NaN/Infinity)
+        intptr_t rem = x % y;
+        if (rem != 0) return false;  // non-integer result → slow path (HeapNumber)
+        // x / y is exact; no overflow possible for division.
+        *out = Value::FromSmi(x / y);
+        return true;
+    }
+    return false;
+}
+
 // Bitwise ops can't overflow (they're Int32), so they always succeed when
 // both operands are Smis. But we still need to check for Smi-ness.
 inline bool TrySmiBitOr(Value a, Value b, Value* out) {

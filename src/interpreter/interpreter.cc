@@ -316,8 +316,15 @@ InterpResult Interp::ExecuteTop() {
             L_Div: {
                 uint8_t r = ReadU8(&pc);
                 pc += 2;
-                // No Smi fast path for Div (result may be non-integer).
-                acc = Div(iso_, acc, regs[r]);
+                // Smi fast path: if both Smis and divides evenly, skip
+                // heap allocation. Falls back to slow path for non-integer
+                // results (e.g. 7/2=3.5) or division by zero.
+                Value result;
+                if (V12_LIKELY(TrySmiDiv(acc, regs[r], &result))) {
+                    acc = result;
+                } else {
+                    acc = Div(iso_, acc, regs[r]);
+                }
                 V12_DISPATCH();
             }
             L_Mod: {
