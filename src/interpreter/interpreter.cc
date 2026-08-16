@@ -942,14 +942,46 @@ InterpResult Interp::ExecuteTop() {
                         acc = obj->properties()[ic.slot];
                         V12_DISPATCH();
                     }
-                    // IC miss: do a full lookup, then update the cache.
+                    // IC miss: check polymorphic IC if present (up to 4 shapes).
+                    uintptr_t shape_bits = reinterpret_cast<uintptr_t>(obj_shape);
+                    if (ic.poly_count >= 1 && ic.poly_count <= 4 &&
+                        ic.poly_entries != nullptr) {
+                        for (uint8_t p = 0; p < ic.poly_count; ++p) {
+                            if (ic.poly_entries[p].shape == shape_bits) {
+                                acc = obj->properties()[ic.poly_entries[p].slot];
+                                V12_DISPATCH();
+                            }
+                        }
+                    }
+                    // Poly miss or megamorphic: do a full lookup.
                     // Use LookupInterned for pointer-compare (2-3x faster).
                     Shape::Slot slot = obj_shape->LookupInterned(
                         iso_->Intern(info->property_names[name_idx]));
                     if (slot != Shape::kInvalidSlot) {
-                        ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
-                        ic.slot = slot;
-                        ic.initialized = true;
+                        // Update the IC: uninit → mono → poly(2-4) → mega.
+                        if (!ic.initialized) {
+                            // First shape: go monomorphic.
+                            ic.shape = shape_bits;
+                            ic.slot = slot;
+                            ic.initialized = true;
+                        } else if (ic.shape != shape_bits) {
+                            // Second+ shape seen: upgrade to polymorphic.
+                            if (ic.poly_count == 0) {
+                                // First poly entry: allocate array of 4.
+                                ic.poly_entries = new PolyIC[4];
+                                ic.poly_entries[0].shape = ic.shape;
+                                ic.poly_entries[0].slot = ic.slot;
+                                ic.poly_count = 1;
+                            }
+                            if (ic.poly_count < 4) {
+                                ic.poly_entries[ic.poly_count].shape = shape_bits;
+                                ic.poly_entries[ic.poly_count].slot = slot;
+                                ic.poly_count++;
+                            } else {
+                                // 5th shape: go megamorphic.
+                                ic.poly_count = 5;
+                            }
+                        }
                         acc = obj->properties()[slot];
                     } else {
                         acc = iso_->undefined_value();

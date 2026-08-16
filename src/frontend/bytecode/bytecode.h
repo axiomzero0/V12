@@ -243,30 +243,44 @@ struct Constant {
 // Each feedback slot (the idx:16 operand on property access AND arithmetic
 // opcodes) maps to an ICEntry. For property access, the IC caches the
 // (Shape, slot) pair. For arithmetic, the IC caches the type seen.
+//
+// IC progression: uninit → monomorphic → polymorphic(4) → megamorphic.
+// The monomorphic fast path (single shape compare) handles the common case.
+// When a second shape is seen, the poly pointer is set to a heap-allocated
+// PolyIC with up to 4 entries. On a 5th shape, poly_count is set to 5
+// (megamorphic) and the IC always takes the slow path.
+struct PolyIC;
+
 struct ICEntry {
     // The shape seen on the last execution. 0 means "uninitialized".
     uintptr_t shape = 0;
     // The property slot index for this shape.
     uint16_t slot = 0xFFFF;
-    // Is this IC entry initialized?
+    // Is this IC entry initialized (monomorphic)?
     bool initialized = false;
     // For LoadGlobal/StoreGlobal: cache the direct pointer to the
-    // property slot in the global object's properties array. This
-    // eliminates the shape compare + array index on every access.
-    // Set on first IC hit, valid as long as the global shape doesn't
-    // change (which it doesn't after startup).
+    // property slot in the global object's properties array.
     uintptr_t value_ptr = 0;
 
     // ----- Type feedback for arithmetic opcodes -----
-    // Records the type seen on the last execution of Add/Sub/Mul/Div.
-    // The baseline JIT reads this to emit a single type guard instead
-    // of assuming Smi and deopting on the first non-Smi.
-    //   0 = uninitialized (no feedback yet)
-    //   1 = Smi (both operands Smi, no overflow)
-    //   2 = Number (HeapNumber or Smi overflow)
-    //   3 = String (string concatenation)
-    //   4 = Other (boolean, object, etc.)
+    //   0 = uninitialized, 1 = Smi, 2 = Number, 3 = String, 4 = Other
     uint8_t type_feedback = 0;
+
+    // ----- Polymorphic IC state -----
+    // poly_count: 0 = monomorphic (or uninit), 1-4 = polymorphic,
+    //             5 = megamorphic (always slow path).
+    // poly_entries: heap-allocated array of (shape, slot) pairs, or nullptr.
+    // Only used for LoadProperty/StoreProperty/CallProperty (not LoadGlobal).
+    uint8_t poly_count = 0;
+    PolyIC* poly_entries = nullptr;
+};
+
+// Polymorphic IC: up to 4 (shape, slot) pairs. Heap-allocated on first
+// polymorphic miss. The count field in ICEntry tracks the actual number
+// of valid entries (1-4 = polymorphic, 5 = megamorphic).
+struct PolyIC {
+    uintptr_t shape;
+    uint16_t slot;
 };
 
 // FunctionInfo: per-function metadata. One per JS function (and one for
