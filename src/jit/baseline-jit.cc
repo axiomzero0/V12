@@ -94,6 +94,15 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
     auto& bc = fi->bytecode;
     if (bc.empty()) return nullptr;
 
+    // Fetch the root Value raw bits at compile time so we can embed them
+    // as immediates in the JIT code. This avoids needing the Isolate
+    // pointer at runtime for comparison results and truthiness checks.
+    Isolate* iso_compile = Isolate::Current();
+    const uint64_t true_bits      = iso_compile->true_value().raw().raw_bits();
+    const uint64_t false_bits     = iso_compile->false_value().raw().raw_bits();
+    const uint64_t undefined_bits = iso_compile->undefined_value().raw().raw_bits();
+    const uint64_t null_bits      = iso_compile->null_value().raw().raw_bits();
+
     // We compile the entire function. Supported opcodes get native code;
     // unsupported opcodes emit a deopt stub (return to interpreter at that
     // bytecode offset). The interpreter resumes and will re-enter the JIT
@@ -274,7 +283,7 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 // by the JIT's add which only modified acc).
                 a.mov(x86::ptr(regs, 0), acc);  // store acc (garbage but won't be used)
                 a.mov(acc, static_cast<uint64_t>(0xDEAD));
-                a.pop(r15); a.pop(r14); a.pop(r13); a.pop(r12); a.pop(rbx);
+                a.pop(r14); a.pop(r12);  // match the 2-push prologue
                 a.ret();
                 a.bind(no_overflow);
                 a.sub(acc, 1);
@@ -368,24 +377,14 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
             }
 
             // ----- Comparisons (Smi fast path) -----
-            // Result is true/false singleton. We load the isolate's
-            // true/false values via a known offset. For simplicity,
-            // we construct the tagged boolean directly.
-            // true = Smi(1) won't work — true is a HeapObject.
-            // Actually, in our VM, true/false are HeapObjects (JSBoolean).
-            // We can't easily construct them in JIT without the Isolate.
-            // So for comparisons, we deopt for now.
-            // TODO: load true/false from Isolate.
+            // Result is the true/false HeapObject singleton (not Smi 0/1).
+            // We embed the raw bits of iso->true_value() / false_value()
+            // as immediates (fetched at JIT compile time).
             case Op::TestLessThan:
             case Op::TestGreaterThan:
             case Op::TestLessThanOrEqual:
             case Op::TestGreaterThanOrEqual:
             case Op::TestEqStrict: {
-                // For now, set acc = 0 (will be fixed when we wire Isolate).
-                // Actually, let's implement Smi comparison and return a
-                // Smi boolean (0 or 1). The interpreter expects Value,
-                // not bool. Smi(0) and Smi(1) will work for truthiness
-                // but won't match === true. This is a known limitation.
                 uint8_t r = bc[i + 1];
                 a.mov(scratch1, x86::ptr(regs, r * 8));
                 // Check both are Smis.
@@ -393,10 +392,12 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 a.jz(labels[bc.size()]);
                 a.test(scratch1, 1);
                 a.jz(labels[bc.size()]);
-                // Compare unshifted values.
+                // Compare unshifted values (tags still on, but both have
+                // the same tag so the comparison result is the same).
                 a.cmp(acc, scratch1);
-                // Set acc = Smi(0) or Smi(1) based on condition.
-                a.mov(acc, kSmiTag);  // Smi(0) = 1 (default: false)
+                // Default: acc = false singleton.
+                a.mov(acc, false_bits);
+                // setcc sets the low byte of scratch2 based on the condition.
                 switch (op) {
                     case Op::TestLessThan:     a.setl(scratch2.r8()); break;
                     case Op::TestGreaterThan:  a.setg(scratch2.r8()); break;
@@ -405,13 +406,14 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                     case Op::TestEqStrict:     a.sete(scratch2.r8()); break;
                     default: break;
                 }
-                // Zero-extend the byte to full 64-bit (setcc only sets low 8 bits,
-                // upper bits are garbage). movzx clears the upper bits.
+                // Zero-extend the byte to full 64-bit.
                 a.movzx(scratch2, scratch2.r8());
-                // If condition true (scratch2 != 0), acc = Smi(1) = 3.
-                a.mov(scratch1, 3);  // Smi(1) = (1 << 1) | 1 = 3
+                // If condition true (scratch2 != 0), acc = true singleton.
                 a.test(scratch2, scratch2);
-                a.cmovnz(acc, scratch1);
+                Label done = a.new_label();
+                a.jz(done);
+                a.mov(acc, true_bits);
+                a.bind(done);
                 break;
             }
 
@@ -430,13 +432,24 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                                   (static_cast<uint32_t>(bc[i+2]) << 8) |
                                   (static_cast<uint32_t>(bc[i+3]) << 16) |
                                   (static_cast<uint32_t>(bc[i+4]) << 24);
-                // IsTruthyFast: Smi != 0, or heap object (truthy unless
-                // undefined/null/false/0/"").
-                // Fast path: if acc is Smi, jump if acc != Smi(0) = 1.
+                // IsTruthy: Smi != 0, or heap object (truthy unless
+                // undefined/null/false).
+                // Fast path 1: if acc is Smi, jump if acc != Smi(0) = 1.
                 a.test(acc, 1);
                 a.jnz(labels[target]);  // Smi and non-zero → truthy
-                // For heap objects, we'd need more checks. For now, deopt.
-                a.jmp(labels[bc.size()]);
+                // Fast path 2: Smi(0) = 1 is falsy → don't jump.
+                a.cmp(acc, kSmiTag);
+                a.je(labels[i + oi.length]);  // Smi(0) → falsy, continue
+                // Heap object path: compare against false/undefined/null.
+                // All three are falsy; any other heap object is truthy.
+                a.cmp(acc, false_bits);
+                a.je(labels[i + oi.length]);  // false → falsy
+                a.cmp(acc, undefined_bits);
+                a.je(labels[i + oi.length]);  // undefined → falsy
+                a.cmp(acc, null_bits);
+                a.je(labels[i + oi.length]);  // null → falsy
+                // Any other heap object → truthy.
+                a.jmp(labels[target]);
                 break;
             }
             case Op::JumpIfFalse: {
@@ -444,14 +457,22 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                                   (static_cast<uint32_t>(bc[i+2]) << 8) |
                                   (static_cast<uint32_t>(bc[i+3]) << 16) |
                                   (static_cast<uint32_t>(bc[i+4]) << 24);
-                // Fast path: if acc is Smi(0) = 1, jump (falsy).
-                a.cmp(acc, kSmiTag);  // Smi(0) = 1
+                // IsFalsy: Smi(0), false, undefined, null.
+                // Fast path 1: if acc is Smi(0) = 1, jump (falsy).
+                a.cmp(acc, kSmiTag);
                 a.je(labels[target]);
-                // If acc is Smi and non-zero, it's truthy → don't jump.
+                // Fast path 2: if acc is Smi and non-zero, don't jump.
                 a.test(acc, 1);
-                a.jnz(labels[i + oi.length]);  // continue (Smi, truthy)
-                // Heap object → deopt.
-                a.jmp(labels[bc.size()]);
+                a.jnz(labels[i + oi.length]);  // Smi non-zero → truthy
+                // Heap object path: compare against false/undefined/null.
+                a.cmp(acc, false_bits);
+                a.je(labels[target]);
+                a.cmp(acc, undefined_bits);
+                a.je(labels[target]);
+                a.cmp(acc, null_bits);
+                a.je(labels[target]);
+                // Any other heap object → truthy, don't jump.
+                a.jmp(labels[i + oi.length]);
                 break;
             }
 
