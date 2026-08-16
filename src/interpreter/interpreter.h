@@ -169,6 +169,25 @@ private:
     [[gnu::noinline]] bool HandleException(Value exc, uint32_t pc_offset,
                                            DispatchState& ds);
 
+    // ----- Cold opcode handlers (extracted from ExecuteTop) -----
+    // These are rarely-executed opcodes with complex handlers. Extracting
+    // them into [[gnu::noinline]] functions reduces ExecuteTop's code size,
+    // improving register allocation for hot paths. Each takes a DispatchState&
+    // and returns true if execution should continue (V12_DISPATCH), or false
+    // if ExecuteTop should return (with the result in ds.acc or via return).
+
+    // Construct (new operator) — cold because it allocates a new object.
+    // Returns true on success, false if an exception was thrown (ds.acc
+    // contains the exception value).
+    [[gnu::noinline]] bool HandleConstruct(DispatchState& ds);
+    // ObjectKeys — cold (for-in iteration setup, allocates an array).
+    [[gnu::noinline]] void HandleObjectKeys(DispatchState& ds);
+    // Throw — cold (exception handling, walks the call stack).
+    // Returns true if a handler was found (ds updated), false if uncaught.
+    [[gnu::noinline]] bool HandleThrow(DispatchState& ds);
+    // CallBuiltin — cold (stub, not yet fully implemented).
+    [[gnu::noinline]] void HandleCallBuiltin(DispatchState& ds);
+
     // Push a new frame — ALWAYS_INLINE for the hot call path.
     [[gnu::always_inline]] Value* PushFrame(FunctionInfo* info, JSFunction* fn,
                      Value this_val, Context* closure_ctx,

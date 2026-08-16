@@ -171,6 +171,143 @@ bool Interp::HandleException(Value exc, uint32_t pc_offset, DispatchState& ds) {
     return false;
 }
 
+// ----- Cold opcode handlers (extracted from ExecuteTop) -----
+// These are rarely-executed opcodes with complex handlers. Extracting them
+// into [[gnu::noinline]] functions reduces ExecuteTop's code size, improving
+// register allocation for hot paths.
+
+// Construct (new operator) — allocates a new object, then calls the callee.
+// Returns true on success, false if an exception was thrown (ds.acc contains
+// the exception value, ds is updated to jump to the catch handler if found).
+bool Interp::HandleConstruct(DispatchState& ds) {
+    Frame* frame = ds.frame;
+    const uint8_t* pc = ds.pc;
+    Value acc = ds.acc;
+    FunctionInfo* info = ds.info;
+    Value* regs = ds.regs;
+    Context* ctx = ds.ctx;
+    const uint8_t* bytecode_base = ds.bytecode_base;
+
+    uint16_t argc = ReadU16(&pc);
+    uint8_t first_arg = ReadU8(&pc);
+    pc += 2;
+    Value callee = acc;
+    Value* args = regs + first_arg;
+    Value new_obj = Value::FromHeap(JSObject::New(iso_));
+    // Host function: call directly.
+    if (callee.IsHostFunction()) {
+        Value result = callee.AsHostFunction()->fn()(
+            this, new_obj, const_cast<Value*>(args), argc);
+        acc = result.IsObject() ? result : new_obj;
+        ds.frame = frame; ds.pc = pc; ds.acc = acc;
+        return true;
+    }
+    // JS function: inline call.
+    if (callee.IsFunction()) {
+        JSFunction* fn = callee.AsFunction();
+        FunctionInfo* callee_info = fn->shared_info();
+        if (callee_info == nullptr) {
+            Value exc = Value::FromHeap(JSString::New(iso_,
+                "TypeError: not a constructor"));
+            uint32_t call_off = static_cast<uint32_t>((pc - bytecode_base) - 1);
+            if (HandleException(exc, call_off, ds)) return true;
+            ds.acc = exc;
+            return false;
+        }
+        frame->pc = pc;
+        Value* new_regs = PushFrame(callee_info, fn, new_obj,
+                                    fn->closure_context(), argc, args);
+        frame = &frames_[frame_top_ - 1];
+        regs = new_regs;
+        ctx = frame->context;
+        info = callee_info;
+        bytecode_base = info->bytecode.data();
+        pc = bytecode_base;
+        ds.frame = frame; ds.pc = pc; ds.acc = acc;
+        ds.info = info; ds.regs = regs; ds.ctx = ctx;
+        ds.bytecode_base = bytecode_base;
+        return true;
+    }
+    // Not callable.
+    {
+        Value exc = Value::FromHeap(JSString::New(iso_,
+            "TypeError: value is not a constructor"));
+        uint32_t call_off = static_cast<uint32_t>((pc - bytecode_base) - 1);
+        if (HandleException(exc, call_off, ds)) return true;
+        ds.acc = exc;
+        return false;
+    }
+}
+
+// ObjectKeys — creates an array of property name strings.
+void Interp::HandleObjectKeys(DispatchState& ds) {
+    ds.pc += 2;  // skip feedback slot
+    JSArray* arr = JSArray::New(iso_, 4);
+    if (ds.acc.IsObject()) {
+        JSObject* obj = ds.acc.AsObject();
+        Shape* shape = obj->shape();
+        for (uint16_t i = 0; i < shape->property_count(); ++i) {
+            std::string_view name = shape->PropertyNameAt(i);
+            Value key = Value::FromHeap(JSString::New(iso_, name));
+            arr->Push(iso_, key);
+        }
+    } else if (ds.acc.IsArray()) {
+        JSArray* a = ds.acc.AsArray();
+        for (uint32_t i = 0; i < a->length(); ++i) {
+            Value key = Value::FromHeap(JSString::NewFromSmi(iso_, static_cast<intptr_t>(i)));
+            arr->Push(iso_, key);
+        }
+    }
+    ds.acc = Value::FromHeap(arr);
+}
+
+// Throw — walks the call stack looking for a catch handler.
+// Returns true if a handler was found (ds updated to jump to catch),
+// false if uncaught (caller should return kThrew).
+bool Interp::HandleThrow(DispatchState& ds) {
+    pending_exception_ = ds.acc;
+    Frame* frame = ds.frame;
+    const uint8_t* pc = ds.pc;
+    Value acc = ds.acc;
+    FunctionInfo* info = ds.info;
+    Value* regs = ds.regs;
+    Context* ctx = ds.ctx;
+    const uint8_t* bytecode_base = ds.bytecode_base;
+
+    uint32_t throw_off = static_cast<uint32_t>((pc - bytecode_base) - 1);
+    while (true) {
+        uint32_t catch_off = info->FindHandler(throw_off);
+        if (catch_off != 0xFFFFFFFF) {
+            pc = bytecode_base + catch_off;
+            acc = pending_exception_;
+            ds.frame = frame; ds.pc = pc; ds.acc = acc;
+            ds.info = info; ds.regs = regs; ds.ctx = ctx;
+            ds.bytecode_base = bytecode_base;
+            return true;
+        }
+        if (frame_top_ <= 1) {
+            frame->pc = pc;
+            ds.acc = acc;
+            return false;
+        }
+        PopFrame();
+        frame = &frames_[frame_top_ - 1];
+        regs = frame->regs;
+        ctx = frame->context;
+        info = frame->info;
+        bytecode_base = info->bytecode.data();
+        throw_off = static_cast<uint32_t>((frame->pc - bytecode_base) - 1);
+    }
+}
+
+// CallBuiltin — stub (not yet fully implemented).
+void Interp::HandleCallBuiltin(DispatchState& ds) {
+    (void)ReadU8(&ds.pc);
+    ds.pc += 2;
+    (void)ReadU8(&ds.pc);
+    ds.acc = iso_->undefined_value();
+}
+
 #ifdef V12_OPCODE_STATS
 // Global opcode dispatch counters (for profiling). Indexed by opcode byte.
 // Declared here and defined in the header so the benchmark tool can read them.
@@ -1266,57 +1403,20 @@ InterpResult Interp::ExecuteTop() {
                 V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
             }
             L_Construct: {
-                uint16_t argc = ReadU16(&pc);
-                uint8_t first_arg = ReadU8(&pc);
-                pc += 2;
-                Value callee = acc;
-                Value* args = regs + first_arg;
-                Value new_obj = Value::FromHeap(JSObject::New(iso_));
-                // Host function: call directly.
-                if (callee.IsHostFunction()) {
-                    Value result = callee.AsHostFunction()->fn()(
-                        this, new_obj, const_cast<Value*>(args), argc);
-                    acc = result.IsObject() ? result : new_obj;
+                // Cold handler — extracted to reduce ExecuteTop code size.
+                DispatchState ds{frame, pc, acc, info, regs, ctx, bytecode_base};
+                if (HandleConstruct(ds)) {
+                    frame = ds.frame; pc = ds.pc; acc = ds.acc;
+                    info = ds.info; regs = ds.regs; ctx = ds.ctx;
+                    bytecode_base = ds.bytecode_base;
                     V12_DISPATCH();
                 }
-                // JS function: inline call.
-                if (callee.IsFunction()) {
-                    JSFunction* fn = callee.AsFunction();
-                    FunctionInfo* callee_info = fn->shared_info();
-                    if (callee_info == nullptr) {
-                        Value exc = Value::FromHeap(JSString::New(iso_,
-                            "TypeError: not a constructor"));
-                        V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
-                    }
-                    frame->pc = pc;
-                    Value* new_regs = PushFrame(callee_info, fn, new_obj,
-                                                fn->closure_context(), argc, args);
-                    frame = &frames_[frame_top_ - 1];
-                    regs = new_regs;
-                    ctx = frame->context;
-                    info = callee_info;
-                    bytecode_base = info->bytecode.data();
-                    pc = bytecode_base;
-                    // Stash new_obj so the Return handler can use it if the
-                    // constructor returns a non-object. We use a special
-                    // frame field... actually, we'll handle this in Return
-                    // by checking if the function was called as a constructor.
-                    // For simplicity, we store new_obj in a thread-local.
-                    // TODO: add a proper constructor_new_obj field to Frame.
-                    V12_DISPATCH();
-                }
-                // Not callable.
-                {
-                    Value exc = Value::FromHeap(JSString::New(iso_,
-                        "TypeError: value is not a constructor"));
-                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
-                }
+                return {InterpStatus::kThrew, ds.acc};
             }
             L_CallBuiltin: {
-                (void)ReadU8(&pc);
-                pc += 2;
-                (void)ReadU8(&pc);
-                acc = iso_->undefined_value();
+                DispatchState ds{frame, pc, acc, info, regs, ctx, bytecode_base};
+                HandleCallBuiltin(ds);
+                pc = ds.pc; acc = ds.acc;
                 V12_DISPATCH();
             }
 
@@ -1413,26 +1513,9 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Iteration -----
             L_ObjectKeys: {
-                pc += 2;
-                // Create an array of property name strings from acc.
-                JSArray* arr = JSArray::New(iso_, 4);
-                if (acc.IsObject()) {
-                    JSObject* obj = acc.AsObject();
-                    Shape* shape = obj->shape();
-                    for (uint16_t i = 0; i < shape->property_count(); ++i) {
-                        std::string_view name = shape->PropertyNameAt(i);
-                        Value key = Value::FromHeap(JSString::New(iso_, name));
-                        arr->Push(iso_, key);
-                    }
-                } else if (acc.IsArray()) {
-                    // Arrays have numeric indices + "length".
-                    JSArray* a = acc.AsArray();
-                    for (uint32_t i = 0; i < a->length(); ++i) {
-                        Value key = Value::FromHeap(JSString::NewFromSmi(iso_, static_cast<intptr_t>(i)));
-                        arr->Push(iso_, key);
-                    }
-                }
-                acc = Value::FromHeap(arr);
+                DispatchState ds{frame, pc, acc, info, regs, ctx, bytecode_base};
+                HandleObjectKeys(ds);
+                pc = ds.pc; acc = ds.acc;
                 V12_DISPATCH();
             }
             L_GetIterator: {
@@ -1497,39 +1580,15 @@ InterpResult Interp::ExecuteTop() {
 
             // ----- Exceptions -----
             L_Throw: {
-                pending_exception_ = acc;
-                // Search for a handler in the current function, then walk
-                // up the call stack until we find one. This handles
-                // exceptions thrown in called functions (which now execute
-                // inline rather than via C++ recursion).
-                uint32_t throw_off = static_cast<uint32_t>(
-                    (pc - bytecode_base) - 1);
-                while (true) {
-                    uint32_t catch_off = info->FindHandler(throw_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        // Found a handler in the current function.
-                        pc = bytecode_base + catch_off;
-                        acc = pending_exception_;
-                        V12_DISPATCH();
-                    }
-                    // No handler in this function — pop the frame and
-                    // search the caller's handler table.
-                    if (frame_top_ <= 1) {
-                        // Toplevel — uncaught exception.
-                        frame->pc = pc;
-                        return {InterpStatus::kThrew, acc};
-                    }
-                    PopFrame();
-                    frame = &frames_[frame_top_ - 1];
-                    regs = frame->regs;
-                    ctx = frame->context;
-                    info = frame->info;
-                    bytecode_base = info->bytecode.data();
-                    // The throw offset in the caller is the offset of the
-                    // Call instruction that invoked us.
-                    throw_off = static_cast<uint32_t>(
-                        (frame->pc - bytecode_base) - 1);
+                // Cold handler — walks the call stack looking for a catch.
+                DispatchState ds{frame, pc, acc, info, regs, ctx, bytecode_base};
+                if (HandleThrow(ds)) {
+                    frame = ds.frame; pc = ds.pc; acc = ds.acc;
+                    info = ds.info; regs = ds.regs; ctx = ds.ctx;
+                    bytecode_base = ds.bytecode_base;
+                    V12_DISPATCH();
                 }
+                return {InterpStatus::kThrew, ds.acc};
             }
             L_TryCatch: {
                 // No-op: the handler table is static (in FunctionInfo).
