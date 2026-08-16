@@ -55,6 +55,8 @@ constexpr OpInfo kOpInfos[] = {
     {Op::AddConst,           "AddConst",           OperandKind::kConst,    OperandKind::kIdx,  OperandKind::kNone, 6},
     {Op::SubConst,           "SubConst",           OperandKind::kConst,    OperandKind::kIdx,  OperandKind::kNone, 6},
     {Op::MulConst,           "MulConst",           OperandKind::kConst,    OperandKind::kIdx,  OperandKind::kNone, 6},
+    {Op::AddSmiConst,        "AddSmiConst",        OperandKind::kImm8,     OperandKind::kIdx,  OperandKind::kNone, 4},
+    {Op::SubSmiConst,        "SubSmiConst",        OperandKind::kImm8,     OperandKind::kIdx,  OperandKind::kNone, 4},
 
     {Op::Negate,             "Negate",             OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},
     {Op::BitNot,             "BitNot",             OperandKind::kIdx,      OperandKind::kNone, OperandKind::kNone, 3},

@@ -65,6 +65,8 @@ static bool IsOpcodeSupported(Op op) {
         case Op::Add:
         case Op::Sub:
         case Op::Mul:
+        case Op::AddSmiConst:
+        case Op::SubSmiConst:
         case Op::BitAnd:
         case Op::BitOr:
         case Op::BitXor:
@@ -324,6 +326,37 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 a.jo(labels[bc.size()]);
                 a.shl(acc, 1);
                 a.or_(acc, 1);
+                break;
+            }
+
+            // ----- AddSmiConst/SubSmiConst -----
+            // acc += Smi(imm8) / acc -= Smi(imm8). Baked immediate.
+            case Op::AddSmiConst: {
+                uint8_t imm = bc[i + 1];
+                Label no_overflow = a.new_label();
+                a.test(acc, 1);
+                a.jz(labels[bc.size()]);
+                a.add(acc, static_cast<uint64_t>(imm) << kSmiShift);
+                a.jno(no_overflow);
+                a.mov(x86::ptr(regs, 0), acc);
+                a.mov(acc, static_cast<uint64_t>(0xDEAD));
+                a.pop(r14); a.pop(r12);
+                a.ret();
+                a.bind(no_overflow);
+                break;
+            }
+            case Op::SubSmiConst: {
+                uint8_t imm = bc[i + 1];
+                Label no_overflow = a.new_label();
+                a.test(acc, 1);
+                a.jz(labels[bc.size()]);
+                a.sub(acc, static_cast<uint64_t>(imm) << kSmiShift);
+                a.jno(no_overflow);
+                a.mov(x86::ptr(regs, 0), acc);
+                a.mov(acc, static_cast<uint64_t>(0xDEAD));
+                a.pop(r14); a.pop(r12);
+                a.ret();
+                a.bind(no_overflow);
                 break;
             }
 

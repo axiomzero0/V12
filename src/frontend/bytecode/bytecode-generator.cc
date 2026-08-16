@@ -239,6 +239,31 @@ size_t BytecodeGenerator::PeepholeOptimize(FunctionInfo* fi) {
             }
         }
 
+        // Pattern: AddConst/SubConst with a small Smi (0-255) → AddSmiConst.
+        // AddSmiConst is 4 bytes (vs 6) and uses the Smi fast path directly.
+        // We NOP out the 2 freed bytes so jump targets stay valid.
+        else if ((op == Op::AddConst || op == Op::SubConst) && oi.length == 6) {
+            uint32_t cidx = static_cast<uint32_t>(bc[i+1]) |
+                            (static_cast<uint32_t>(bc[i+2]) << 8) |
+                            (static_cast<uint32_t>(bc[i+3]) << 16) |
+                            (static_cast<uint32_t>(bc[i+4]) << 24);
+            uint16_t ic_slot = static_cast<uint16_t>(bc[i+5]) |
+                               (static_cast<uint16_t>(bc[i+6]) << 8);
+            if (cidx < fi->constants.size()) {
+                const Constant& c = fi->constants[cidx];
+                if (c.kind == Constant::Kind::kSmi &&
+                    c.smi >= 0 && c.smi <= 255) {
+                    Op new_op = (op == Op::AddConst) ? Op::AddSmiConst : Op::SubSmiConst;
+                    bc[i]   = static_cast<uint8_t>(new_op);
+                    bc[i+1] = static_cast<uint8_t>(c.smi);
+                    bc[i+2] = static_cast<uint8_t>(ic_slot & 0xFF);
+                    bc[i+3] = static_cast<uint8_t>(ic_slot >> 8);
+                    bc[i+4] = static_cast<uint8_t>(Op::Nop);
+                    bc[i+5] = static_cast<uint8_t>(Op::Nop);
+                }
+            }
+        }
+
         i = next;
     }
 

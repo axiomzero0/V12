@@ -97,6 +97,8 @@ enum class Op : uint8_t {
     AddConst,           // acc = acc + const[idx]
     SubConst,
     MulConst,
+    AddSmiConst,        // acc = acc + Smi(imm8)  — baked small int
+    SubSmiConst,        // acc = acc - Smi(imm8)
 
     // Arithmetic - unary
     Negate,             // acc = -acc

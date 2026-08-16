@@ -337,7 +337,7 @@ InterpResult Interp::ExecuteTop() {
         &&L_Ldar, &&L_Star, &&L_Mov,
         &&L_Add, &&L_Sub, &&L_Mul, &&L_Div, &&L_Mod, &&L_Exp,
         &&L_BitOr, &&L_BitAnd, &&L_BitXor, &&L_Shl, &&L_Shr, &&L_Ushr,
-        &&L_AddConst, &&L_SubConst, &&L_MulConst,
+        &&L_AddConst, &&L_SubConst, &&L_MulConst, &&L_AddSmiConst, &&L_SubSmiConst,
         &&L_Negate, &&L_BitNot, &&L_LogicalNot, &&L_Typeof,
         &&L_TestEqual, &&L_TestNotEqual, &&L_TestEqStrict, &&L_TestNotEqStrict,
         &&L_TestLessThan, &&L_TestGreaterThan, &&L_TestLessThanOrEqual,
@@ -574,6 +574,32 @@ InterpResult Interp::ExecuteTop() {
                 uint32_t cidx = ReadU32(&pc);
                 pc += 2;
                 acc = Mul(iso_, acc, info->ResolveConstant(iso_, cidx));
+                V12_DISPATCH();
+            }
+            // AddSmiConst/SubSmiConst: acc += Smi(imm8) / acc -= Smi(imm8).
+            // Baked small-int immediate — no ResolveConstant, no Add() call.
+            L_AddSmiConst: {
+                uint8_t imm = ReadU8(&pc);
+                pc += 2;  // skip feedback slot
+                Value smi_val = Value::FromSmi(static_cast<intptr_t>(imm));
+                Value result;
+                if (V12_LIKELY(TrySmiAdd(acc, smi_val, &result))) {
+                    acc = result;
+                } else {
+                    acc = Add(iso_, acc, smi_val);
+                }
+                V12_DISPATCH();
+            }
+            L_SubSmiConst: {
+                uint8_t imm = ReadU8(&pc);
+                pc += 2;  // skip feedback slot
+                Value smi_val = Value::FromSmi(static_cast<intptr_t>(imm));
+                Value result;
+                if (V12_LIKELY(TrySmiSub(acc, smi_val, &result))) {
+                    acc = result;
+                } else {
+                    acc = Sub(iso_, acc, smi_val);
+                }
                 V12_DISPATCH();
             }
 
