@@ -33,6 +33,9 @@ option(V12_ENABLE_BENCHMARKS  "Build benchmark binaries"               OFF)
 option(V12_ENABLE_TOOLS       "Build standalone tools"                 ON)
 option(V12_WERROR             "Treat warnings as errors"               OFF)
 option(V12_BUILD_SHARED_LIBS  "Build shared libraries"                 OFF)
+option(V12_ENABLE_LTO         "Enable Link-Time Optimization (Release)" OFF)
+option(V12_ENABLE_MARCH_NATIVE "Enable -march=native (Release)"         OFF)
+option(V12_ENABLE_PGO         "Enable Profile-Guided Optimization (two-pass)" OFF)
 
 # -----------------------------------------------------------------------------
 # C++ standard - we use C++20 features (concepts, ranges, std::span)
@@ -87,8 +90,48 @@ endif()
 add_library(v12_warning_flags INTERFACE)
 target_compile_options(v12_warning_flags INTERFACE ${V12_WARNING_FLAGS})
 
-# Always include debug symbols, even in Release (useful for backtraces)
-add_compile_options(-g3 -fno-omit-frame-pointer)
+# Always include debug symbols, even in Release (useful for backtraces).
+# Use -g1 (line tables only) in Release to reduce binary size; -g3 in Debug.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-g3 -fno-omit-frame-pointer)
+else()
+    add_compile_options(-g1)
+endif()
+
+# -----------------------------------------------------------------------------
+# LTO + march=native + PGO (Tier 1 free speedup, ~1.3-1.8x)
+# -----------------------------------------------------------------------------
+# Enabled via V12_ENABLE_LTO / V12_ENABLE_MARCH_NATIVE / V12_ENABLE_PGO.
+# For a quick release build with all optimizations:
+#   cmake -DCMAKE_BUILD_TYPE=Release -DV12_ENABLE_LTO=ON -DV12_ENABLE_MARCH_NATIVE=ON
+# For PGO (two-pass):
+#   1. cmake -DCMAKE_BUILD_TYPE=Release -DV12_ENABLE_PGO=ON -DV12_PGO_PHASE=generate
+#   2. run benchmarks
+#   3. cmake -DCMAKE_BUILD_TYPE=Release -DV12_ENABLE_PGO=ON -DV12_PGO_PHASE=use
+set(V12_PGO_PHASE "generate" CACHE STRING "PGO phase: generate or use")
+
+if(V12_ENABLE_PGO)
+    if(V12_PGO_PHASE STREQUAL "generate")
+        add_compile_options(-fprofile-generate -fprofile-dir=${CMAKE_BINARY_DIR}/pgo)
+        add_link_options(-fprofile-generate -fprofile-dir=${CMAKE_BINARY_DIR}/pgo)
+        message(STATUS "V12: PGO generate phase")
+    elseif(V12_PGO_PHASE STREQUAL "use")
+        add_compile_options(-fprofile-use -fprofile-dir=${CMAKE_BINARY_DIR}/pgo -fprofile-correction)
+        add_link_options(-fprofile-use -fprofile-dir=${CMAKE_BINARY_DIR}/pgo -fprofile-correction)
+        message(STATUS "V12: PGO use phase")
+    endif()
+endif()
+
+if(V12_ENABLE_LTO)
+    add_compile_options(-flto=thin)
+    add_link_options(-flto=thin)
+    message(STATUS "V12: LTO enabled")
+endif()
+
+if(V12_ENABLE_MARCH_NATIVE)
+    add_compile_options(-march=native -fno-plt)
+    message(STATUS "V12: -march=native enabled")
+endif()
 
 # -----------------------------------------------------------------------------
 # Sanitizer configuration
