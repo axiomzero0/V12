@@ -1114,33 +1114,15 @@ InterpResult Interp::ExecuteTop() {
                     V12_DISPATCH();
                 }
             }
-            L_Call0:
-            L_Call1:
-            L_Call2: {
-                uint8_t opcode_byte = pc[-1];
+            // Call0/Call1/Call2 split into separate handlers to avoid
+            // re-decoding the opcode (pc[-1]) and the cascading if/else.
+            L_Call0: {
+                pc += 2;  // skip feedback slot
                 Value callee = acc;
-                Value this_val = iso_->undefined_value();
-                Value argbuf[2];
-                uint32_t argc = 0;
-                if (opcode_byte == static_cast<uint8_t>(Op::Call1)) {
-                    uint8_t r = ReadU8(&pc);
-                    pc += 2;
-                    argbuf[0] = regs[r];
-                    argc = 1;
-                } else if (opcode_byte == static_cast<uint8_t>(Op::Call2)) {
-                    uint8_t r1 = ReadU8(&pc);
-                    uint8_t r2 = ReadU8(&pc);
-                    pc += 2;
-                    argbuf[0] = regs[r1];
-                    argbuf[1] = regs[r2];
-                    argc = 2;
-                } else {
-                    pc += 2;
-                }
                 // Host function: call directly.
                 if (callee.IsHostFunction()) {
                     acc = callee.AsHostFunction()->fn()(
-                        this, this_val, argbuf, argc);
+                        this, iso_->undefined_value(), nullptr, 0);
                     V12_DISPATCH();
                 }
                 // JS function: inline call.
@@ -1153,22 +1135,87 @@ InterpResult Interp::ExecuteTop() {
                         V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                     }
                     frame->pc = pc;
-                    Value* new_regs = PushFrame(callee_info, fn, this_val,
-                                                fn->closure_context(), argc, argbuf);
+                    regs = PushFrame(callee_info, fn, iso_->undefined_value(),
+                                     fn->closure_context(), 0, nullptr);
                     frame = &frames_[frame_top_ - 1];
-                    regs = new_regs;
                     ctx = frame->context;
                     info = callee_info;
                     bytecode_base = info->bytecode.data();
                     pc = bytecode_base;
                     V12_DISPATCH();
                 }
-                // Not callable.
-                {
-                    Value exc = Value::FromHeap(JSString::New(iso_,
-                        "TypeError: value is not a function"));
-                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
+                Value exc = Value::FromHeap(JSString::New(iso_,
+                    "TypeError: value is not a function"));
+                V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
+            }
+            L_Call1: {
+                uint8_t r = ReadU8(&pc);
+                pc += 2;  // skip feedback slot
+                Value callee = acc;
+                Value argbuf[1] = {regs[r]};
+                // Host function: call directly.
+                if (callee.IsHostFunction()) {
+                    acc = callee.AsHostFunction()->fn()(
+                        this, iso_->undefined_value(), argbuf, 1);
+                    V12_DISPATCH();
                 }
+                // JS function: inline call.
+                if (V12_LIKELY(callee.IsFunction())) {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    if (callee_info == nullptr) {
+                        Value exc = Value::FromHeap(JSString::New(iso_,
+                            "TypeError: not a function"));
+                        V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
+                    }
+                    frame->pc = pc;
+                    regs = PushFrame(callee_info, fn, iso_->undefined_value(),
+                                     fn->closure_context(), 1, argbuf);
+                    frame = &frames_[frame_top_ - 1];
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    V12_DISPATCH();
+                }
+                Value exc = Value::FromHeap(JSString::New(iso_,
+                    "TypeError: value is not a function"));
+                V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
+            }
+            L_Call2: {
+                uint8_t r1 = ReadU8(&pc);
+                uint8_t r2 = ReadU8(&pc);
+                pc += 2;  // skip feedback slot
+                Value callee = acc;
+                Value argbuf[2] = {regs[r1], regs[r2]};
+                // Host function: call directly.
+                if (callee.IsHostFunction()) {
+                    acc = callee.AsHostFunction()->fn()(
+                        this, iso_->undefined_value(), argbuf, 2);
+                    V12_DISPATCH();
+                }
+                // JS function: inline call.
+                if (V12_LIKELY(callee.IsFunction())) {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    if (callee_info == nullptr) {
+                        Value exc = Value::FromHeap(JSString::New(iso_,
+                            "TypeError: not a function"));
+                        V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
+                    }
+                    frame->pc = pc;
+                    regs = PushFrame(callee_info, fn, iso_->undefined_value(),
+                                     fn->closure_context(), 2, argbuf);
+                    frame = &frames_[frame_top_ - 1];
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    V12_DISPATCH();
+                }
+                Value exc = Value::FromHeap(JSString::New(iso_,
+                    "TypeError: value is not a function"));
+                V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
             }
             L_Construct: {
                 uint16_t argc = ReadU16(&pc);
