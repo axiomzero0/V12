@@ -1090,20 +1090,29 @@ InterpResult Interp::ExecuteTop() {
                     V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
 
-                frame->pc = pc;
-                InterpResult r;
+                // Inline the JS callee path (same pattern as L_Call) to
+                // avoid C++ recursion via CallFunction/ExecuteTop.
                 if (callee.IsHostFunction()) {
-                    r = CallHostFunction(callee.AsHostFunction(), receiver, args, argc);
-                } else {
-                    r = CallFunction(callee.AsFunction(), receiver, args, argc);
+                    // Host function: call directly, no frame push.
+                    frame->pc = pc;
+                    acc = callee.AsHostFunction()->fn()(
+                        this, receiver, const_cast<Value*>(args), argc);
+                    V12_DISPATCH();
                 }
-                if (r.status == InterpStatus::kThrew) {
-                    V12_THROW(r.value, static_cast<uint32_t>((pc - bytecode_base) - 1));
+                // JS function: inline push frame and dispatch.
+                {
+                    JSFunction* fn = callee.AsFunction();
+                    FunctionInfo* callee_info = fn->shared_info();
+                    frame->pc = pc;
+                    regs = PushFrame(callee_info, fn, receiver,
+                                     fn->closure_context(), argc, args);
+                    frame = &frames_[frame_top_ - 1];
+                    ctx = frame->context;
+                    info = callee_info;
+                    bytecode_base = info->bytecode.data();
+                    pc = bytecode_base;
+                    V12_DISPATCH();
                 }
-                frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                pc = frame->pc;
-                acc = r.value;
-                V12_DISPATCH();
             }
             L_Call0:
             L_Call1:
