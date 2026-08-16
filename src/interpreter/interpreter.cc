@@ -1007,7 +1007,7 @@ InterpResult Interp::ExecuteTop() {
                 uint16_t argc = ReadU16(&pc);
                 uint8_t prop_idx = ReadU8(&pc);
                 uint8_t first_arg = ReadU8(&pc);
-                pc += 2;
+                uint16_t ic_slot = ReadU16(&pc);
 
                 Value receiver = acc;
                 Value* args = regs + first_arg;
@@ -1016,7 +1016,27 @@ InterpResult Interp::ExecuteTop() {
                 Value callee;
                 std::string_view method_name = info->property_names[prop_idx];
                 if (receiver.IsObject()) {
-                    callee = receiver.AsObject()->GetProperty(iso_, method_name);
+                    // CallProperty IC: cache (shape, slot) so that repeated
+                    // obj.method() calls skip the linear Shape::Lookup.
+                    JSObject* obj = receiver.AsObject();
+                    Shape* obj_shape = obj->shape();
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_LIKELY(ic.initialized &&
+                                   ic.shape == reinterpret_cast<uintptr_t>(obj_shape))) {
+                        // IC hit: read the method directly from the cached slot.
+                        callee = obj->properties()[ic.slot];
+                    } else {
+                        // IC miss: full lookup, then update cache.
+                        Shape::Slot slot = obj_shape->Lookup(method_name);
+                        if (slot != Shape::kInvalidSlot) {
+                            ic.shape = reinterpret_cast<uintptr_t>(obj_shape);
+                            ic.slot = slot;
+                            ic.initialized = true;
+                            callee = obj->properties()[slot];
+                        } else {
+                            callee = iso_->undefined_value();
+                        }
+                    }
                 } else if (receiver.IsArray()) {
                     // Built-in array methods.
                     if (method_name == "push") {
