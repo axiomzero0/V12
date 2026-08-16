@@ -94,7 +94,7 @@ struct PhysicalRegister {
 // -----------------------------------------------------------------------------
 // Operands
 // -----------------------------------------------------------------------------
-enum class OperandKind : uint8_t {
+enum class MachOperandKind : uint8_t {
     kNone,
     kVReg,          // a virtual register
     kPReg,          // a physical register (post-RA, or fixed registers like stack pointer)
@@ -106,7 +106,7 @@ enum class OperandKind : uint8_t {
 };
 
 struct MachineOperand {
-    OperandKind kind = OperandKind::kNone;
+    MachOperandKind kind = MachOperandKind::kNone;
     Rep rep = Rep::kNone;
 
     // Union of all possible payload types.
@@ -125,35 +125,35 @@ struct MachineOperand {
     int32_t displacement = 0;
 
     static MachineOperand VRegOf(VReg r, Rep rep = Rep::kTagged) {
-        MachineOperand o; o.kind = OperandKind::kVReg; o.rep = rep; o.vreg = r; return o;
+        MachineOperand o; o.kind = MachOperandKind::kVReg; o.rep = rep; o.vreg = r; return o;
     }
     static MachineOperand PRegOf(PhysicalRegister p, Rep rep = Rep::kTagged) {
-        MachineOperand o; o.kind = OperandKind::kPReg; o.rep = rep; o.preg = p; return o;
+        MachineOperand o; o.kind = MachOperandKind::kPReg; o.rep = rep; o.preg = p; return o;
     }
     static MachineOperand ImmOf(int64_t v, Rep rep = Rep::kInt64) {
-        MachineOperand o; o.kind = OperandKind::kImmediate; o.rep = rep; o.imm = v; return o;
+        MachineOperand o; o.kind = MachOperandKind::kImmediate; o.rep = rep; o.imm = v; return o;
     }
     static MachineOperand FloatImmOf(double v) {
-        MachineOperand o; o.kind = OperandKind::kFloatImmediate; o.rep = Rep::kFloat64; o.fimm = v; return o;
+        MachineOperand o; o.kind = MachOperandKind::kFloatImmediate; o.rep = Rep::kFloat64; o.fimm = v; return o;
     }
     static MachineOperand LabelOf(uint32_t block_id) {
-        MachineOperand o; o.kind = OperandKind::kLabel; o.block_id = block_id; return o;
+        MachineOperand o; o.kind = MachOperandKind::kLabel; o.block_id = block_id; return o;
     }
     static MachineOperand MemOf(VReg base, int32_t disp, Rep rep = Rep::kTagged) {
-        MachineOperand o; o.kind = OperandKind::kMemory; o.rep = rep;
+        MachineOperand o; o.kind = MachOperandKind::kMemory; o.rep = rep;
         o.base_vreg = base; o.displacement = disp; o.scale = 1;
         return o;
     }
     static MachineOperand SymbolOf(uint32_t id) {
-        MachineOperand o; o.kind = OperandKind::kSymbol; o.symbol_id = id; return o;
+        MachineOperand o; o.kind = MachOperandKind::kSymbol; o.symbol_id = id; return o;
     }
 
-    bool IsVReg() const { return kind == OperandKind::kVReg; }
-    bool IsPReg() const { return kind == OperandKind::kPReg; }
-    bool IsImmediate() const { return kind == OperandKind::kImmediate; }
-    bool IsMemory() const { return kind == OperandKind::kMemory; }
-    bool IsLabel() const { return kind == OperandKind::kLabel; }
-    bool IsSymbol() const { return kind == OperandKind::kSymbol; }
+    bool IsVReg() const { return kind == MachOperandKind::kVReg; }
+    bool IsPReg() const { return kind == MachOperandKind::kPReg; }
+    bool IsImmediate() const { return kind == MachOperandKind::kImmediate; }
+    bool IsMemory() const { return kind == MachOperandKind::kMemory; }
+    bool IsLabel() const { return kind == MachOperandKind::kLabel; }
+    bool IsSymbol() const { return kind == MachOperandKind::kSymbol; }
 };
 
 // -----------------------------------------------------------------------------
