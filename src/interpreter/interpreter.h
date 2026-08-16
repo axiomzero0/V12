@@ -111,6 +111,19 @@ private:
         JSFunction* function; // the JSFunction being executed (or nullptr for toplevel)
     };
 
+    // DispatchState: the local variables used by ExecuteTop's dispatch loop.
+    // Passed to HandleException so it can update the frame state when a
+    // catch handler is found.
+    struct DispatchState {
+        Frame* frame;
+        const uint8_t* pc;
+        Value acc;
+        FunctionInfo* info;
+        Value* regs;
+        Context* ctx;
+        const uint8_t* bytecode_base;
+    };
+
     Isolate* iso_;
 
     // The currently-running program. Used by CreateClosure to look up
@@ -138,10 +151,23 @@ private:
     uint32_t max_depth_ = 100000;
 
     // Execute the top frame on the frame stack until it returns or throws.
-    // Marked [[gnu::hot]] and [[gnu::flatten]] so the compiler prioritizes
-    // inlining this function and its callees (TrySmiAdd, IsTruthyFast, etc.)
-    // into the dispatch loop.
-    [[gnu::hot, gnu::flatten]] InterpResult ExecuteTop();
+    // Marked [[gnu::hot]] so the compiler prioritizes this function for
+    // optimization. We intentionally do NOT use [[gnu::flatten]] — flattening
+    // a 1500-line function causes excessive code size and register pressure.
+    [[gnu::hot]] InterpResult ExecuteTop();
+
+    // Cold exception-handling helper. Called when a TypeError/etc. is thrown
+    // from a Call/CallProperty/Construct handler. Searches the handler table
+    // for a catch clause. Returns true if a handler was found (in which case
+    // the frame state is updated to jump to the catch handler); false if no
+    // handler was found (caller should return kThrew).
+    //
+    // Marked [[gnu::noinline]] to keep the cold exception-handling code out
+    // of the hot dispatch loop in ExecuteTop. This significantly reduces
+    // ExecuteTop's code size and improves register allocation.
+    struct DispatchState;
+    [[gnu::noinline]] bool HandleException(Value exc, uint32_t pc_offset,
+                                           DispatchState& ds);
 
     // Push a new frame — ALWAYS_INLINE for the hot call path.
     [[gnu::always_inline]] Value* PushFrame(FunctionInfo* info, JSFunction* fn,

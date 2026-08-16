@@ -130,6 +130,47 @@ InterpResult Interp::CallHostFunction(HostFunction* fn, Value this_val,
 //
 // This requires GCC or Clang. MSVC is not supported.
 // -----------------------------------------------------------------------------
+
+// Macro: throw an exception and either jump to a catch handler or return.
+// Uses HandleException (noinline) to keep the cold exception-handling code
+// out of ExecuteTop, reducing function size and improving register allocation.
+// `pc_off_expr` is evaluated to get the bytecode offset of the throwing
+// instruction (for handler-table lookup).
+#define V12_THROW(exc_val, pc_off_expr) do { \
+    Value _exc = (exc_val); \
+    DispatchState _ds{frame, pc, acc, info, regs, ctx, bytecode_base}; \
+    if (HandleException(_exc, (pc_off_expr), _ds)) { \
+        frame = _ds.frame; pc = _ds.pc; acc = _ds.acc; \
+        info = _ds.info; regs = _ds.regs; ctx = _ds.ctx; \
+        bytecode_base = _ds.bytecode_base; \
+        V12_DISPATCH(); \
+    } \
+    return {InterpStatus::kThrew, _exc}; \
+} while(0)
+
+// Cold exception-handling helper. Called from Call/CallProperty/Construct
+// handlers when a TypeError is thrown or a callee throws. Searches the
+// handler table for a catch clause. Returns true if a handler was found
+// (ds is updated to jump to the catch handler); false if no handler was
+// found (caller should return kThrew).
+//
+// Marked [[gnu::noinline]] to keep this cold code out of ExecuteTop.
+bool Interp::HandleException(Value exc, uint32_t pc_offset, DispatchState& ds) {
+    pending_exception_ = exc;
+    uint32_t catch_off = ds.info->FindHandler(pc_offset);
+    if (catch_off != 0xFFFFFFFF) {
+        ds.frame = &frames_[frame_top_ - 1];
+        ds.regs = ds.frame->regs;
+        ds.ctx = ds.frame->context;
+        ds.info = ds.frame->info;
+        ds.bytecode_base = ds.info->bytecode.data();
+        ds.pc = ds.bytecode_base + catch_off;
+        ds.acc = exc;
+        return true;
+    }
+    return false;
+}
+
 #ifdef V12_OPCODE_STATS
 // Global opcode dispatch counters (for profiling). Indexed by opcode byte.
 // Declared here and defined in the header so the benchmark tool can read them.
@@ -950,23 +991,12 @@ InterpResult Interp::ExecuteTop() {
                 }
                 // Not callable.
                 {
-                    uint32_t call_off = static_cast<uint32_t>((pc - bytecode_base) - 1);
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
-                    pending_exception_ = exc;
-                    uint32_t catch_off = info->FindHandler(call_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                        pc = bytecode_base + catch_off;
-                        acc = exc;
-                        V12_DISPATCH();
-                    }
-                    return {InterpStatus::kThrew, exc};
+                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
             }
             L_CallProperty: {
-                uint32_t call_off = static_cast<uint32_t>(
-                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t prop_idx = ReadU8(&pc);
                 uint8_t first_arg = ReadU8(&pc);
@@ -1057,16 +1087,7 @@ InterpResult Interp::ExecuteTop() {
                 if (!callee.IsFunction()) {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: method is not a function"));
-                    pending_exception_ = exc;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                        pc = bytecode_base + catch_off;
-                        acc = exc;
-                        V12_DISPATCH();
-                    }
-                    return {InterpStatus::kThrew, exc};
+                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
 
                 frame->pc = pc;
@@ -1077,16 +1098,7 @@ InterpResult Interp::ExecuteTop() {
                     r = CallFunction(callee.AsFunction(), receiver, args, argc);
                 }
                 if (r.status == InterpStatus::kThrew) {
-                    pending_exception_ = r.value;
-                    uint32_t pc_off = call_off;
-                    uint32_t catch_off = info->FindHandler(pc_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                        pc = bytecode_base + catch_off;
-                        acc = r.value;
-                        V12_DISPATCH();
-                    }
-                    return r;
+                    V12_THROW(r.value, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
                 frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
                 pc = frame->pc;
@@ -1096,8 +1108,6 @@ InterpResult Interp::ExecuteTop() {
             L_Call0:
             L_Call1:
             L_Call2: {
-                uint32_t call_off = static_cast<uint32_t>(
-                    (pc - bytecode_base) - 1);
                 uint8_t opcode_byte = pc[-1];
                 Value callee = acc;
                 Value this_val = iso_->undefined_value();
@@ -1131,15 +1141,7 @@ InterpResult Interp::ExecuteTop() {
                     if (callee_info == nullptr) {
                         Value exc = Value::FromHeap(JSString::New(iso_,
                             "TypeError: not a function"));
-                        pending_exception_ = exc;
-                        uint32_t catch_off = info->FindHandler(call_off);
-                        if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                            pc = bytecode_base + catch_off;
-                            acc = exc;
-                            V12_DISPATCH();
-                        }
-                        return {InterpStatus::kThrew, exc};
+                        V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                     }
                     frame->pc = pc;
                     Value* new_regs = PushFrame(callee_info, fn, this_val,
@@ -1156,20 +1158,10 @@ InterpResult Interp::ExecuteTop() {
                 {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a function"));
-                    pending_exception_ = exc;
-                    uint32_t catch_off = info->FindHandler(call_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                        pc = bytecode_base + catch_off;
-                        acc = exc;
-                        V12_DISPATCH();
-                    }
-                    return {InterpStatus::kThrew, exc};
+                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
             }
             L_Construct: {
-                uint32_t call_off = static_cast<uint32_t>(
-                    (pc - bytecode_base) - 1);
                 uint16_t argc = ReadU16(&pc);
                 uint8_t first_arg = ReadU8(&pc);
                 pc += 2;
@@ -1190,15 +1182,7 @@ InterpResult Interp::ExecuteTop() {
                     if (callee_info == nullptr) {
                         Value exc = Value::FromHeap(JSString::New(iso_,
                             "TypeError: not a constructor"));
-                        pending_exception_ = exc;
-                        uint32_t catch_off = info->FindHandler(call_off);
-                        if (catch_off != 0xFFFFFFFF) {
-                            frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                            pc = bytecode_base + catch_off;
-                            acc = exc;
-                            V12_DISPATCH();
-                        }
-                        return {InterpStatus::kThrew, exc};
+                        V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                     }
                     frame->pc = pc;
                     Value* new_regs = PushFrame(callee_info, fn, new_obj,
@@ -1221,15 +1205,7 @@ InterpResult Interp::ExecuteTop() {
                 {
                     Value exc = Value::FromHeap(JSString::New(iso_,
                         "TypeError: value is not a constructor"));
-                    pending_exception_ = exc;
-                    uint32_t catch_off = info->FindHandler(call_off);
-                    if (catch_off != 0xFFFFFFFF) {
-                        frame = &frames_[frame_top_ - 1]; regs = frame->regs; ctx = frame->context; info = frame->info; bytecode_base = info->bytecode.data();
-                        pc = bytecode_base + catch_off;
-                        acc = exc;
-                        V12_DISPATCH();
-                    }
-                    return {InterpStatus::kThrew, exc};
+                    V12_THROW(exc, static_cast<uint32_t>((pc - bytecode_base) - 1));
                 }
             }
             L_CallBuiltin: {
