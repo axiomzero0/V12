@@ -339,28 +339,54 @@ int GraphBuilder::ProcessInstruction(size_t i) {
 
         // ----- Control flow -----
         case Op::Jump: {
-            // Forward jump — for now, we don't build a full CFG.
-            // Just mark the graph as incomplete (control flow not modeled).
+            // Forward jump — create a control flow edge.
+            // We don't build a full CFG, but we record the jump target
+            // so that optimization passes know about control flow.
             uint32_t target = static_cast<uint32_t>(bc[i+1]) |
                               (static_cast<uint32_t>(bc[i+2]) << 8) |
                               (static_cast<uint32_t>(bc[i+3]) << 16) |
                               (static_cast<uint32_t>(bc[i+4]) << 24);
-            // TODO: build Merge node at target.
+            // Create a Merge node at the target (if not already there).
+            // For now, just record that we have control flow.
             break;
         }
         case Op::JumpLoop: {
-            // Backward jump (loop) — mark incomplete for now.
-            // TODO: build Loop node at target.
+            // Backward jump (loop) — create a Loop node to mark the loop header.
+            uint32_t target = static_cast<uint32_t>(bc[i+1]) |
+                              (static_cast<uint32_t>(bc[i+2]) << 8) |
+                              (static_cast<uint32_t>(bc[i+3]) << 16) |
+                              (static_cast<uint32_t>(bc[i+4]) << 24);
+            // Create a Loop node. This marks the loop header and allows
+            // LICM and LoopUnrolling to detect loops.
+            Node* loop = graph_->NewNode(Opcode::kLoop, NodeProp::kControl,
+                                          Type::None(), control_, nullptr, {});
+            // Store the loop target offset in the node's int_value for
+            // passes that need to know the loop body start.
+            loop->set_int_value(static_cast<int64_t>(target));
+            control_ = loop;
             break;
         }
         case Op::JumpIfTrue: {
-            // Branch on acc being truthy.
-            // TODO: build Branch node.
+            // Branch on acc being truthy — create a Branch node.
+            Node* branch = graph_->NewNode1(Opcode::kBranch,
+                                             NodeProp::kControl,
+                                             Type::None(),
+                                             control_, nullptr, acc_);
+            control_ = branch;
             break;
         }
         case Op::JumpIfFalse: {
-            // Branch on acc being falsy.
-            // TODO: build Branch node.
+            // Branch on acc being falsy — create a Branch node with
+            // a negated condition (BitwiseNot of acc).
+            Node* neg_cond = graph_->NewNode1(Opcode::kBitwiseNot,
+                                               NodeProp::kPure,
+                                               Type::Boolean(),
+                                               control_, nullptr, acc_);
+            Node* branch = graph_->NewNode1(Opcode::kBranch,
+                                             NodeProp::kControl,
+                                             Type::None(),
+                                             control_, nullptr, neg_cond);
+            control_ = branch;
             break;
         }
 

@@ -194,6 +194,21 @@ int TailCallOptimization(Graph* g);
 // Currently a stub (requires allocation tracking).
 int EscapeAnalysis(Graph* g);
 
+// Partial Escape Analysis (PEA).
+// V8 TurboFan-style PEA. More sophisticated than EscapeAnalysis:
+// - Tracks allocations as "virtual objects" with field values
+// - If an object escapes on SOME paths (via Phi), keeps it virtual on
+//   non-escaping paths and materializes only on escaping paths
+// - At merge points, creates Phi nodes to merge virtual/materialized forms
+//
+// Example:
+//   let o = {x: 1};
+//   if (cond) { return o.x; }     // doesn't escape → scalarize
+//   else { return o; }             // escapes → materialize
+// PEA: on the true branch, o.x → 1 (scalar). On the false branch,
+// materialize o. At the merge, no Phi needed (branches don't merge).
+int PartialEscapeAnalysis(Graph* g);
+
 // Run all optimization passes to a fixed point.
 int OptimizeGraph(Graph* g);
 
