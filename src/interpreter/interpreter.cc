@@ -927,15 +927,13 @@ InterpResult Interp::ExecuteTop() {
                     auto entry = reinterpret_cast<JitEntry>(co->entry_point());
                     uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
                     if (ret != 0) {
-                        // Deopt: increment counter (don't kill JIT immediately).
-                        // Allow re-entry after cooldown — the JIT will be
-                        // re-entered on the next JumpLoop if deopt_count < 10.
+                        // Deopt: acc is saved in frame->jit_deopt_acc by the JIT.
                         info->deopt_count++;
                         uint32_t resume_pc = (ret == 0xDEAD)
                             ? target
                             : static_cast<uint32_t>(ret - 1);
                         pc = bytecode_base + resume_pc;
-                        acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
+                        acc = Value(TaggedValue::FromRawBits(frame->jit_deopt_acc));
                         V12_DISPATCH();
                     }
                     // Normal return: the JIT'd function executed a Return or

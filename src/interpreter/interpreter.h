@@ -109,6 +109,7 @@ private:
         Context* context;     // current context (for closure access)
         Value this_val;
         JSFunction* function; // the JSFunction being executed (or nullptr for toplevel)
+        uintptr_t jit_deopt_acc = 0;  // JIT stores acc here on deopt
     };
 
     // DispatchState: the local variables used by ExecuteTop's dispatch loop.
@@ -147,6 +148,10 @@ private:
 
     // Pending exception (set by Throw, cleared by TryCatch).
     Value pending_exception_;
+
+    // Deopt accumulator: the JIT saves acc here on deopt (via RBX).
+    // The interpreter reads it back after the JIT call returns nonzero.
+    uintptr_t jit_deopt_acc_ = 0;
 
     uint32_t max_depth_ = 100000;
 

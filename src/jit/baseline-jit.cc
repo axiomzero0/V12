@@ -140,9 +140,6 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
     const x86::Gp scratch2 = rdx;
 
     // Prologue: save callee-saved registers that we actually clobber.
-    // We clobber r12 (iso) and r14 (not used anymore — but keep for ABI).
-    // We do NOT clobber rbx, r13, r15 — so don't save them (saves 6
-    // memory ops per JIT entry/exit).
     a.push(r12);
     a.push(r14);
 
@@ -519,9 +516,6 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 break;
 
             case Op::ReturnUndefined: {
-                // Store undefined in regs[0] and return 0 (normal return).
-                // We embed the undefined value's raw bits as a constant
-                // (obtained from Isolate::Current() at compile time).
                 uintptr_t undef_bits = Isolate::Current()->undefined_value()
                                           .raw().raw_bits();
                 a.mov(x86::ptr(regs, 0), static_cast<uint64_t>(undef_bits));
@@ -533,9 +527,9 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
             }
 
             default:
-                // Unsupported opcode: store acc in regs[0], return deopt
-                // flag = offset+1 (nonzero = deopt at bytecode offset ret-1).
-                a.mov(x86::ptr(regs, 0), acc);
+                // Unsupported opcode: deopt.
+                // Save acc to rbx, return deopt offset+1 in rax.
+                a.mov(x86::ptr(frame, 48), acc);  // frame->jit_deopt_acc = acc
                 a.mov(acc, static_cast<uint64_t>(i + 1));
                 a.pop(r14);
                 a.pop(r12);
@@ -547,11 +541,10 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
     }
 
     // Deopt label (used by Smi-check failures and overflow).
-    // Store acc in regs[0], return 0xDEAD (special deopt sentinel that
-    // tells the interpreter to resume at the JumpLoop target).
+    // Save acc to rbx, return 0xDEAD (deopt sentinel).
     a.bind(labels[bc.size()]);
-    a.mov(x86::ptr(regs, 0), acc);  // store acc
-    a.mov(acc, static_cast<uint64_t>(0xDEAD));  // deopt sentinel
+    a.mov(x86::ptr(frame, 48), acc);  // frame->jit_deopt_acc = acc
+    a.mov(acc, static_cast<uint64_t>(0xDEAD));
     a.pop(r14);
     a.pop(r12);
     a.ret();
