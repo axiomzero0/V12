@@ -1125,30 +1125,24 @@ InterpResult Interp::ExecuteTop() {
                 uint8_t name_idx = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
                 auto& ic = info->GetIC(ic_slot);
-                // Fast path: if we have a cached value pointer, just load it.
-                // This is 2 operations: load ic.value_ptr, load *ptr.
-                // No shape compare, no GetIC vector lookup on the hot path.
-                if (V12_LIKELY(ic.value_ptr != 0)) {
+                // Fast path: if we have a cached value pointer AND the
+                // global shape hasn't changed, just load it.
+                // We MUST check the shape because GrowProperties can
+                // reallocate the properties array, making value_ptr dangling.
+                JSObject* g = iso_->global_object();
+                Shape* gshape = g->shape();
+                if (V12_LIKELY(ic.value_ptr != 0 &&
+                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
                     acc = *reinterpret_cast<Value*>(ic.value_ptr);
                     V12_DISPATCH();
                 }
-                // Slow path: first-time lookup. Find the slot, cache the
-                // direct pointer to the property slot.
-                JSObject* g = iso_->global_object();
-                Shape* gshape = g->shape();
+                // Slow path: first-time lookup or shape changed.
                 std::string_view name = info->property_names[name_idx];
-                Shape::Slot slot = Shape::kInvalidSlot;
-                for (uint16_t i = 0; i < gshape->property_count(); ++i) {
-                    if (gshape->PropertyNameAt(i) == name) {
-                        slot = i;
-                        break;
-                    }
-                }
+                Shape::Slot slot = gshape->LookupInterned(iso_->Intern(name));
                 if (slot != Shape::kInvalidSlot) {
                     ic.shape = reinterpret_cast<uintptr_t>(gshape);
                     ic.slot = slot;
                     ic.initialized = true;
-                    // Cache the direct pointer to the property slot.
                     ic.value_ptr = reinterpret_cast<uintptr_t>(&g->properties()[slot]);
                     acc = g->properties()[slot];
                 } else {
@@ -1162,13 +1156,16 @@ InterpResult Interp::ExecuteTop() {
                 uint8_t name_idx = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
                 auto& ic = info->GetIC(ic_slot);
-                // Fast path: direct store via cached pointer.
-                if (V12_LIKELY(ic.value_ptr != 0)) {
+                // Fast path: direct store via cached pointer, but ONLY if
+                // the global shape hasn't changed (GrowProperties can
+                // reallocate the properties array).
+                JSObject* g = iso_->global_object();
+                Shape* gshape = g->shape();
+                if (V12_LIKELY(ic.value_ptr != 0 &&
+                               ic.shape == reinterpret_cast<uintptr_t>(gshape))) {
                     *reinterpret_cast<Value*>(ic.value_ptr) = acc;
                     V12_DISPATCH();
                 }
-                JSObject* g = iso_->global_object();
-                Shape* gshape = g->shape();
                 std::string_view name = info->property_names[name_idx];
                 Shape::Slot slot = gshape->LookupInterned(iso_->Intern(name));
                 if (slot != Shape::kInvalidSlot) {
@@ -1179,6 +1176,9 @@ InterpResult Interp::ExecuteTop() {
                     g->properties()[slot] = acc;
                 } else {
                     g->SetProperty(iso_, name, acc);
+                    // Invalidate the IC — the shape changed.
+                    ic.value_ptr = 0;
+                    ic.initialized = false;
                 }
                 V12_DISPATCH();
             }

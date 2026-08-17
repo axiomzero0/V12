@@ -64,6 +64,10 @@ public:
     uint64_t bytes_allocated() const { return total_bytes_allocated_; }
     uint64_t gc_count() const { return gc_count_; }
 
+    // Debug access
+    const std::vector<std::unique_ptr<HeapChunk>>& chunks_for_debug() const { return chunks_; }
+    HeapChunk* current_chunk_for_debug() const { return current_chunk_; }
+
 private:
     void AllocateNewChunk(size_t min_size);
     void Mark(HeapObject* obj);
