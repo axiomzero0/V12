@@ -413,6 +413,20 @@ struct FunctionInfo {
     bool lazy_is_toplevel = false;
 
     // (resolved_constants is declared in cache line 1 above.)
+
+    // ----- IR-optimized bytecode -----
+    // If non-empty, this is the IR-optimized bytecode produced by
+    // OptimizeBytecode(). The interpreter and JIT use this instead of
+    // the original bytecode when present.
+    std::vector<uint8_t> optimized_bytecode;
+
+    // Whether IR optimization has been attempted (avoids re-running).
+    bool ir_optimized = false;
+
+    // IR optimization tier-up counter (separate from hotness_counter).
+    // When this crosses kIROptThreshold, the interpreter triggers
+    // OptimizeBytecode().
+    uint32_t ir_hotness_counter = 0;
 };
 
 // BytecodeProgram: the result of compiling a whole source file. Owns:

@@ -36,6 +36,7 @@
 #include "frontend/bytecode/bytecode.h"
 #include "frontend/bytecode/bytecode-generator.h"
 #ifndef V12_NO_JIT
+#include "ir/opt/bytecode-optimizer.h"
 #include "jit/baseline-jit.h"
 #endif
 #include "vm/isolate/isolate.h"
@@ -417,11 +418,10 @@ InterpResult Interp::ExecuteTop() {
             // ----- Binary arithmetic -----
             // Format: op  r:8  idx:16   ->   acc = acc <op> regs[r]
             // Hot path: try Smi fast path first, fall back to slow path.
-            // Type feedback is ONLY recorded on the slow path (non-Smi) to
-            // avoid overhead on the common Smi case. The JIT reads the
-            // feedback to decide what code to emit: if type_feedback == 0
-            // (uninit), it assumes Smi (the common case). If kNumber, it
-            // emits Number code. If kString, it deopts.
+            // Type feedback: 0 = uninit, 1 = Smi, 2 = Number, 3 = String.
+            // On the fast path, we set feedback to kSmi (1) once — this lets
+            // the JIT skip the Smi tag checks on recompilation.
+            // On the slow path, we record the actual type.
             L_Add: {
                 uint8_t r = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
@@ -429,9 +429,12 @@ InterpResult Interp::ExecuteTop() {
                 Value result;
                 if (V12_LIKELY(TrySmiAdd(lhs, rhs, &result))) {
                     acc = result;
+                    // Set feedback to Smi (only if not already set — avoids
+                    // per-iteration store overhead).
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_UNLIKELY(ic.type_feedback == 0)) ic.type_feedback = 1;
                 } else {
                     acc = Add(iso_, lhs, rhs);
-                    // Record type feedback only on slow path.
                     info->GetIC(ic_slot).type_feedback =
                         static_cast<uint8_t>(ClassifyBinaryOp(lhs, rhs));
                 }
@@ -444,6 +447,8 @@ InterpResult Interp::ExecuteTop() {
                 Value result;
                 if (V12_LIKELY(TrySmiSub(lhs, rhs, &result))) {
                     acc = result;
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_UNLIKELY(ic.type_feedback == 0)) ic.type_feedback = 1;
                 } else {
                     acc = Sub(iso_, lhs, rhs);
                     info->GetIC(ic_slot).type_feedback =
@@ -458,6 +463,8 @@ InterpResult Interp::ExecuteTop() {
                 Value result;
                 if (V12_LIKELY(TrySmiMul(lhs, rhs, &result))) {
                     acc = result;
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_UNLIKELY(ic.type_feedback == 0)) ic.type_feedback = 1;
                 } else {
                     acc = Mul(iso_, lhs, rhs);
                     info->GetIC(ic_slot).type_feedback =
@@ -863,13 +870,34 @@ InterpResult Interp::ExecuteTop() {
             L_JumpLoop: {
                 uint32_t target = ReadU32(&pc);
                 info->hotness_counter++;
+                info->ir_hotness_counter++;
 #ifndef V12_NO_JIT
+                // Tier 1: Baseline JIT at kOSRThreshold (500 iterations).
                 if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
                                  info->jit_code == 0)) {
                     // Compile with OSR entry at the loop start.
                     auto co = BaselineJIT::Compile(info, target);
                     if (co) {
                         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
+                    }
+                }
+                // Tier 1.5: IR optimization at kIROptThreshold (2000 iterations).
+                // Runs the 21-pass IR optimizer to produce better bytecode
+                // and type feedback, then recompiles the JIT.
+                if (V12_UNLIKELY(info->ir_hotness_counter == kIROptThreshold &&
+                                 !info->ir_optimized)) {
+                    Arena ir_arena;
+                    OptimizeBytecode(iso_, &ir_arena, info);
+                    // If optimization produced better type info, recompile JIT.
+                    if (info->ir_optimized && info->jit_code != 0) {
+                        // Free old JIT code and recompile with optimized info.
+                        // (The JIT reads type_feedback from IC entries.)
+                        info->jit_code = 0;
+                        info->deopt_count = 0;
+                        auto co = BaselineJIT::Compile(info, target);
+                        if (co) {
+                            info->jit_code = reinterpret_cast<uintptr_t>(co.release());
+                        }
                     }
                 }
                 // Execute JIT if available and not too many deopts.

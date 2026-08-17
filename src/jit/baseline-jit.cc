@@ -247,45 +247,37 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 break;
             }
 
-            // ----- Arithmetic (Smi fast path) -----
-            // For Add/Sub/Mul: check both operands are Smis (low bit = 1),
-            // do the arithmetic on the unshifted values, check overflow.
-            // If not Smi or overflow, deopt.
+            // ----- Arithmetic (Smi fast path with type feedback) -----
+            // For Add/Sub/Mul: if type feedback says both operands are Smis
+            // (type_feedback == 1), skip the Smi tag checks entirely.
+            // Otherwise, emit the checks and deopt on non-Smi.
             case Op::Add: {
                 uint8_t r = bc[i + 1];
+                uint16_t ic_slot = static_cast<uint16_t>(bc[i+2]) |
+                                   (static_cast<uint16_t>(bc[i+3]) << 8);
+                // Check type feedback: 1 = Smi, 0 = unknown.
+                bool known_smi = false;
+                if (ic_slot < fi->ic_entries.size()) {
+                    known_smi = fi->ic_entries[ic_slot].type_feedback == 1;
+                }
+
                 Label no_overflow = a.new_label();
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                a.test(acc, 1);
-                a.jz(labels[bc.size()]);
-                a.test(scratch1, 1);
-                a.jz(labels[bc.size()]);
+
+                if (!known_smi) {
+                    // Emit Smi tag checks (deopt on non-Smi).
+                    a.test(acc, 1);
+                    a.jz(labels[bc.size()]);
+                    a.test(scratch1, 1);
+                    a.jz(labels[bc.size()]);
+                }
                 // Smi add: a + b - 1 = correct tagged result.
                 a.add(acc, scratch1);
                 a.jno(no_overflow);
-                // Overflow: reload acc from the register that Ldar loaded
-                // (we don't know which one, so store the overflowed acc
-                // and deopt to THIS instruction so the interpreter redoes it).
-                // The interpreter will see acc = overflowed value, but it
-                // will call Add() which uses ToDouble (handles any value).
-                // Actually, the interpreter's Add handler reads acc and regs[r].
-                // acc is the overflowed value (garbage). We need to restore
-                // acc to the value BEFORE the add. But we don't have it.
-                // Solution: deopt to the instruction BEFORE the Add (the Ldar).
-                // The Ldar will reload acc from the register, then the Add
-                // will be redone by the interpreter.
-                // But we don't know the Ldar's offset. Instead, just store
-                // the overflowed acc and deopt to the Add offset. The
-                // interpreter's Add handler calls Add(iso, acc, regs[r]).
-                // acc is the overflowed tagged value. Add() calls ToDouble
-                // which will interpret it as a Smi (wrong value) or crash.
-                //
-                // Better: just deopt to the generic label and let the
-                // interpreter redo from the loop start. The registers are
-                // still valid (s and i are in their registers, untouched
-                // by the JIT's add which only modified acc).
-                a.mov(x86::ptr(regs, 0), acc);  // store acc (garbage but won't be used)
+                // Overflow → deopt.
+                a.mov(x86::ptr(regs, 0), acc);
                 a.mov(acc, static_cast<uint64_t>(0xDEAD));
-                a.pop(r14); a.pop(r12);  // match the 2-push prologue
+                a.pop(r14); a.pop(r12);
                 a.ret();
                 a.bind(no_overflow);
                 a.sub(acc, 1);
@@ -293,14 +285,19 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
             }
             case Op::Sub: {
                 uint8_t r = bc[i + 1];
+                uint16_t ic_slot = static_cast<uint16_t>(bc[i+2]) |
+                                   (static_cast<uint16_t>(bc[i+3]) << 8);
+                bool known_smi = false;
+                if (ic_slot < fi->ic_entries.size()) {
+                    known_smi = fi->ic_entries[ic_slot].type_feedback == 1;
+                }
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                a.test(acc, 1);
-                a.jz(labels[bc.size()]);
-                a.test(scratch1, 1);
-                a.jz(labels[bc.size()]);
-                // acc - scratch1 = (av - bv)*2 + 1 - 1 + 1 = (av-bv)*2 + 1
-                // Wait: a - b = (av*2+1) - (bv*2+1) = (av-bv)*2
-                // We want (av-bv)*2 + 1. So a - b + 1.
+                if (!known_smi) {
+                    a.test(acc, 1);
+                    a.jz(labels[bc.size()]);
+                    a.test(scratch1, 1);
+                    a.jz(labels[bc.size()]);
+                }
                 a.sub(acc, scratch1);
                 a.jo(labels[bc.size()]);
                 a.add(acc, 1);
@@ -308,18 +305,19 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
             }
             case Op::Mul: {
                 uint8_t r = bc[i + 1];
+                uint16_t ic_slot = static_cast<uint16_t>(bc[i+2]) |
+                                   (static_cast<uint16_t>(bc[i+3]) << 8);
+                bool known_smi = false;
+                if (ic_slot < fi->ic_entries.size()) {
+                    known_smi = fi->ic_entries[ic_slot].type_feedback == 1;
+                }
                 a.mov(scratch1, x86::ptr(regs, r * 8));
-                a.test(acc, 1);
-                a.jz(labels[bc.size()]);
-                a.test(scratch1, 1);
-                a.jz(labels[bc.size()]);
-                // a * b = (av*2+1) * (bv*2+1) — complex. Simpler:
-                // shr acc, 1 (get av, lose tag)
-                // shr scratch1, 1 (get bv)
-                // imul acc, scratch1 (av * bv)
-                // jo deopt
-                // shl acc, 1
-                // or acc, 1 (set tag)
+                if (!known_smi) {
+                    a.test(acc, 1);
+                    a.jz(labels[bc.size()]);
+                    a.test(scratch1, 1);
+                    a.jz(labels[bc.size()]);
+                }
                 a.shr(acc, 1);
                 a.shr(scratch1, 1);
                 a.imul(acc, scratch1);
