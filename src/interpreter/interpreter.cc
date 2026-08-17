@@ -38,6 +38,7 @@
 #ifndef V12_NO_JIT
 #include "ir/opt/bytecode-optimizer.h"
 #include "jit/baseline-jit.h"
+#include "jit/optimizing-jit.h"
 #endif
 #include "vm/isolate/isolate.h"
 #include "vm/objects/context.h"
@@ -880,7 +881,7 @@ InterpResult Interp::ExecuteTop() {
                         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                     }
                 }
-                // Tier 1.5: IR optimization at kIROptThreshold (2000 iterations).
+                // Tier 1.5: IR optimization at kIROptThreshold (1000 iterations).
                 // Runs the 21-pass IR optimizer to produce better bytecode
                 // and type feedback, then recompiles the JIT.
                 if (V12_UNLIKELY(info->ir_hotness_counter == kIROptThreshold &&
@@ -889,14 +890,23 @@ InterpResult Interp::ExecuteTop() {
                     OptimizeBytecode(iso_, &ir_arena, info);
                     // If optimization produced better type info, recompile JIT.
                     if (info->ir_optimized && info->jit_code != 0) {
-                        // Free old JIT code and recompile with optimized info.
-                        // (The JIT reads type_feedback from IC entries.)
                         info->jit_code = 0;
                         info->deopt_count = 0;
                         auto co = BaselineJIT::Compile(info, target);
                         if (co) {
                             info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                         }
+                    }
+                }
+                // Tier 2: Optimizing JIT at kOptThreshold (3000 iterations).
+                // Uses the IR pipeline + asmjit Compiler for per-function
+                // code with register allocation. No icache pressure.
+                if (V12_UNLIKELY(info->ir_hotness_counter == OptimizingJIT::kOptThreshold &&
+                                 info->jit_code != 0)) {
+                    Arena opt_arena;
+                    auto co = OptimizingJIT::Compile(info, iso_, &opt_arena);
+                    if (co) {
+                        info->jit_code = reinterpret_cast<uintptr_t>(co.release());
                     }
                 }
                 // Execute JIT if available and not too many deopts.

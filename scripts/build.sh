@@ -82,6 +82,7 @@ SRCS=$(find "${SRC_DIR}" -name "*.cc" -o -name "*.cpp" | sort)
 ASMJIT_SRCS=$(find "${V12_ROOT}/third_party/asmjit/asmjit/core" -name "*.cpp" | sort)
 ASMJIT_SRCS="${ASMJIT_SRCS} $(find "${V12_ROOT}/third_party/asmjit/asmjit/x86" -name "*.cpp" | sort)"
 ASMJIT_SRCS="${ASMJIT_SRCS} $(find "${V12_ROOT}/third_party/asmjit/asmjit/support" -name "*.cpp" | sort)"
+ASMJIT_SRCS="${ASMJIT_SRCS} $(find "${V12_ROOT}/third_party/asmjit/asmjit/arm" -name "*.cpp" | sort)"
 
 echo "==> Compiling V12 library (${MODE})..."
 OBJ_FILES=""
