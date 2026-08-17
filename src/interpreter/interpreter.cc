@@ -476,12 +476,11 @@ InterpResult Interp::ExecuteTop() {
                 uint8_t r = ReadU8(&pc);
                 uint16_t ic_slot = ReadU16(&pc);
                 Value lhs = acc, rhs = regs[r];
-                // Smi fast path: if both Smis and divides evenly, skip
-                // heap allocation. Falls back to slow path for non-integer
-                // results (e.g. 7/2=3.5) or division by zero.
                 Value result;
                 if (V12_LIKELY(TrySmiDiv(lhs, rhs, &result))) {
                     acc = result;
+                    auto& ic = info->GetIC(ic_slot);
+                    if (V12_UNLIKELY(ic.type_feedback == 0)) ic.type_feedback = 1;
                 } else {
                     acc = Div(iso_, lhs, rhs);
                     info->GetIC(ic_slot).type_feedback =

@@ -48,8 +48,8 @@ inline bool IsOptimized(FunctionInfo* fi) {
 
 // Tier-up threshold for IR optimization (higher than baseline JIT).
 // The baseline JIT triggers at 500 iterations; IR optimization triggers
-// at 2000 iterations (after the baseline JIT has profiled the function).
-static constexpr uint32_t kIROptThreshold = 2000;
+// at 1000 iterations (after the baseline JIT has profiled the function).
+static constexpr uint32_t kIROptThreshold = 1000;
 
 }  // namespace v12
 
