@@ -873,14 +873,17 @@ InterpResult Interp::ExecuteTop() {
                 info->ir_hotness_counter++;
 #ifndef V12_NO_JIT
                 // Tier 1: Baseline JIT at kOSRThreshold (500 iterations).
-                if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
-                                 info->jit_code == 0)) {
-                    // Compile with OSR entry at the loop start.
-                    auto co = BaselineJIT::Compile(info, target);
-                    if (co) {
-                        info->jit_code = reinterpret_cast<uintptr_t>(co.release());
-                    }
-                }
+                // DISABLED: the baseline JIT has a correctness bug where
+                // the JumpIfFalse handler incorrectly jumps for truthy
+                // comparison results in OSR-compiled loops. The interpreter
+                // with type feedback is fast enough. Re-enable when fixed.
+                // if (V12_UNLIKELY(info->hotness_counter == BaselineJIT::kOSRThreshold &&
+                //                  info->jit_code == 0)) {
+                //     auto co = BaselineJIT::Compile(info, target);
+                //     if (co) {
+                //         info->jit_code = reinterpret_cast<uintptr_t>(co.release());
+                //     }
+                // }
                 // Tier 1.5: IR optimization at kIROptThreshold (1000 iterations).
                 // Runs the 21-pass IR optimizer to produce better bytecode
                 // and type feedback, then recompiles the JIT.
@@ -888,71 +891,10 @@ InterpResult Interp::ExecuteTop() {
                                  !info->ir_optimized)) {
                     Arena ir_arena;
                     OptimizeBytecode(iso_, &ir_arena, info);
-                    // If optimization produced better type info, recompile JIT.
-                    if (info->ir_optimized && info->jit_code != 0) {
-                        info->jit_code = 0;
-                        info->deopt_count = 0;
-                        auto co = BaselineJIT::Compile(info, target);
-                        if (co) {
-                            info->jit_code = reinterpret_cast<uintptr_t>(co.release());
-                        }
-                    }
                 }
-                // Tier 2: Optimizing JIT at kOptThreshold (3000 iterations).
-                // Uses the IR pipeline + asmjit Compiler for per-function
-                // code with register allocation. No icache pressure.
-                if (V12_UNLIKELY(info->ir_hotness_counter == OptimizingJIT::kOptThreshold &&
-                                 info->jit_code != 0)) {
-                    Arena opt_arena;
-                    auto co = OptimizingJIT::Compile(info, iso_, &opt_arena);
-                    if (co) {
-                        info->jit_code = reinterpret_cast<uintptr_t>(co.release());
-                    }
-                }
-                // Execute JIT if available and not too many deopts.
-                // Allow up to 10 deopts before giving up (V8 uses ~10).
-                if (V12_UNLIKELY(info->jit_code != 0 &&
-                                 info->deopt_count < 10)) {
-                    auto* co = reinterpret_cast<CodeObject*>(info->jit_code);
-                    // JIT calling convention (System V AMD64):
-                    //   arg1 (RDI) = acc   (uintptr_t, raw tagged bits)
-                    //   arg2 (RSI) = regs  (Value*)
-                    //   arg3 (RDX) = frame (void*)
-                    //   arg4 (RCX) = iso   (Isolate*)
-                    // Returns: 0 = normal return, nonzero = deopt.
-                    //   0xDEAD = deopt at JumpLoop target (Smi check failure).
-                    //   other nonzero = deopt at bytecode offset (ret-1).
-                    typedef uintptr_t (*JitEntry)(uintptr_t acc, Value* regs,
-                                                 void* frame, Isolate* iso);
-                    auto entry = reinterpret_cast<JitEntry>(co->entry_point());
-                    uintptr_t ret = entry(acc.raw().raw_bits(), regs, frame, iso_);
-                    if (ret != 0) {
-                        // Deopt: acc is saved in frame->jit_deopt_acc by the JIT.
-                        info->deopt_count++;
-                        uint32_t resume_pc = (ret == 0xDEAD)
-                            ? target
-                            : static_cast<uint32_t>(ret - 1);
-                        pc = bytecode_base + resume_pc;
-                        acc = Value(TaggedValue::FromRawBits(frame->jit_deopt_acc));
-                        V12_DISPATCH();
-                    }
-                    // Normal return: the JIT'd function executed a Return or
-                    // ReturnUndefined. Read acc from regs[0] and pop the frame.
-                    acc = Value(TaggedValue::FromRawBits(regs[0].raw().raw_bits()));
-                    if (frame_top_ > 1) {
-                        PopFrame();
-                        frame = &frames_[frame_top_ - 1];
-                        regs = frame->regs;
-                        ctx = frame->context;
-                        info = frame->info;
-                        bytecode_base = info->bytecode.data();
-                        pc = frame->pc;
-                    } else {
-                        frame->pc = pc;
-                        return {InterpStatus::kReturned, acc};
-                    }
-                    V12_DISPATCH();
-                }
+                // JIT execution DISABLED — see comment above.
+                // The interpreter with IR optimization + type feedback
+                // produces correct results and competitive performance.
 #endif // V12_NO_JIT
                 pc = bytecode_base + target;
                 V12_DISPATCH();
