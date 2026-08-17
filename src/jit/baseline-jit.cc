@@ -420,28 +420,22 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                 a.jz(labels[bc.size()]);
                 a.test(scratch1, 1);
                 a.jz(labels[bc.size()]);
-                // Compare unshifted values (tags still on, but both have
-                // the same tag so the comparison result is the same).
+                // Compare tagged values (both Smis, same tag, so result
+                // is the same as comparing untagged values).
                 a.cmp(acc, scratch1);
-                // Default: acc = false singleton.
+                // Use cmov to select true/false singleton.
+                // Default: acc = false. Conditionally: acc = true.
+                // We use scratch2 as a temp to hold true_bits, then cmov.
+                a.mov(scratch2, true_bits);
                 a.mov(acc, false_bits);
-                // setcc sets the low byte of scratch2 based on the condition.
                 switch (op) {
-                    case Op::TestLessThan:     a.setl(scratch2.r8()); break;
-                    case Op::TestGreaterThan:  a.setg(scratch2.r8()); break;
-                    case Op::TestLessThanOrEqual:    a.setle(scratch2.r8()); break;
-                    case Op::TestGreaterThanOrEqual: a.setge(scratch2.r8()); break;
-                    case Op::TestEqStrict:     a.sete(scratch2.r8()); break;
+                    case Op::TestLessThan:          a.cmovl(acc, scratch2); break;
+                    case Op::TestGreaterThan:       a.cmovg(acc, scratch2); break;
+                    case Op::TestLessThanOrEqual:   a.cmovle(acc, scratch2); break;
+                    case Op::TestGreaterThanOrEqual:a.cmovge(acc, scratch2); break;
+                    case Op::TestEqStrict:          a.cmove(acc, scratch2); break;
                     default: break;
                 }
-                // Zero-extend the byte to full 64-bit.
-                a.movzx(scratch2, scratch2.r8());
-                // If condition true (scratch2 != 0), acc = true singleton.
-                a.test(scratch2, scratch2);
-                Label done = a.new_label();
-                a.jz(done);
-                a.mov(acc, true_bits);
-                a.bind(done);
                 break;
             }
 
@@ -485,22 +479,21 @@ std::unique_ptr<CodeObject> BaselineJIT::Compile(FunctionInfo* fi,
                                   (static_cast<uint32_t>(bc[i+2]) << 8) |
                                   (static_cast<uint32_t>(bc[i+3]) << 16) |
                                   (static_cast<uint32_t>(bc[i+4]) << 24);
-                // IsFalsy: Smi(0), false, undefined, null.
-                // Fast path 1: if acc is Smi(0) = 1, jump (falsy).
-                a.cmp(acc, kSmiTag);
-                a.je(labels[target]);
-                // Fast path 2: if acc is Smi and non-zero, don't jump.
-                a.test(acc, 1);
-                a.jnz(labels[i + oi.length]);  // Smi non-zero → truthy
-                // Heap object path: compare against false/undefined/null.
+                // IsFalsy: check false, undefined, null, and Smi(0).
+                // The comparison result from TestLessThan is either
+                // true_bits or false_bits (heap object singletons).
+                // For the common case (comparison result), we only need
+                // to check false_bits. For general truthiness (which
+                // could be any value), we also check undefined/null/Smi(0).
                 a.cmp(acc, false_bits);
                 a.je(labels[target]);
                 a.cmp(acc, undefined_bits);
                 a.je(labels[target]);
                 a.cmp(acc, null_bits);
                 a.je(labels[target]);
-                // Any other heap object → truthy, don't jump.
-                a.jmp(labels[i + oi.length]);
+                a.cmp(acc, kSmiTag);  // Smi(0) = 1
+                a.je(labels[target]);
+                // Anything else is truthy — fall through.
                 break;
             }
 
